@@ -123,8 +123,8 @@ public class App {
                 )
                 .withTerminationConfig(
                     new TerminationConfig()
-                        .withSecondsSpentLimit(60L)           // Max 60 seconds total
-                        .withUnimprovedSecondsSpentLimit(20L) // Stop if no improvement for 20s
+                        .withSecondsSpentLimit(5L)            // Max 5 seconds total
+                        .withUnimprovedSecondsSpentLimit(2L)  // Stop if no improvement for 2s
                 );
 
             // Create solver factory

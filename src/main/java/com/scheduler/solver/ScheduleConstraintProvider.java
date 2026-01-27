@@ -13,6 +13,9 @@ import com.scheduler.domain.StaffAssignment;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.util.Set;
+import java.util.UUID;
+
 /**
  * Contraintes du staff scheduler.
  *
@@ -42,13 +45,15 @@ public class ScheduleConstraintProvider implements ConstraintProvider {
             siteEligibility(factory),       // H2: Site requis
             shiftCapacity(factory),         // H9b: Capacité max
 
-            // MEDIUM - couverture
-            uncoveredSurgical(factory),
-            uncoveredConsultation(factory),
+            // MEDIUM - couverture (bonus pour shifts couverts)
+            coveredSurgical(factory),
+            coveredConsultation(factory),
 
             // SOFT - préférences
             skillPreference(factory),
             sitePreference(factory),
+            locationContinuity(factory),   // S3: Bonus même localisation AM/PM
+            siteChangePenalty(factory),    // S4: Pénalité changement de site
         };
     }
 
@@ -185,33 +190,86 @@ public class ScheduleConstraintProvider implements ConstraintProvider {
     }
 
     // =========================================================================
-    // MEDIUM CONSTRAINTS (couverture)
+    // MEDIUM CONSTRAINTS (couverture - bonus pour shifts couverts)
     // =========================================================================
 
     /**
-     * M1: Pénalise les shifts surgical non couverts.
+     * M1: Bonus pour les shifts surgical couverts.
+     * Score = base(200) × skillMultiplier + physicianBonus
+     *
+     * Surgical P4 (200) > Consultation P1 (160) → garantit que surgical est prioritaire
      */
-    Constraint uncoveredSurgical(ConstraintFactory factory) {
-        return factory.forEach(Shift.class)
-            .filter(s -> "surgical".equals(s.getNeedType()))
-            .ifNotExists(StaffAssignment.class,
-                Joiners.equal(s -> s, StaffAssignment::getShift))
-            .penalize(HardMediumSoftScore.ofMedium(15),
-                Shift::getQuantityNeeded)
-            .asConstraint("M1: Uncovered surgical");
+    Constraint coveredSurgical(ConstraintFactory factory) {
+        return factory.forEach(StaffAssignment.class)
+            .filter(a -> !a.getShift().isRest())
+            .filter(a -> !a.getShift().isAdmin())
+            .filter(a -> "surgical".equals(a.getShift().getNeedType()))
+            .reward(HardMediumSoftScore.ofMedium(1),
+                a -> calculateMediumScore(a, 200))
+            .asConstraint("M1: Covered surgical");
     }
 
     /**
-     * M2: Pénalise les shifts consultation non couverts.
+     * M2: Bonus pour les shifts consultation couverts.
+     * Score = base(40) × skillMultiplier + physicianBonus
      */
-    Constraint uncoveredConsultation(ConstraintFactory factory) {
-        return factory.forEach(Shift.class)
-            .filter(s -> "consultation".equals(s.getNeedType()))
-            .ifNotExists(StaffAssignment.class,
-                Joiners.equal(s -> s, StaffAssignment::getShift))
-            .penalize(HardMediumSoftScore.ofMedium(10),
-                Shift::getQuantityNeeded)
-            .asConstraint("M2: Uncovered consultation");
+    Constraint coveredConsultation(ConstraintFactory factory) {
+        return factory.forEach(StaffAssignment.class)
+            .filter(a -> !a.getShift().isRest())
+            .filter(a -> !a.getShift().isAdmin())
+            .filter(a -> "consultation".equals(a.getShift().getNeedType()))
+            .reward(HardMediumSoftScore.ofMedium(1),
+                a -> calculateMediumScore(a, 40))
+            .asConstraint("M2: Covered consultation");
+    }
+
+    /**
+     * Calcule le score MEDIUM pour une assignation.
+     *
+     * @param a L'assignation
+     * @param base Score de base (200 pour surgical, 40 pour consultation)
+     * @return Score total = base × skillMultiplier + physicianBonus
+     *
+     * Skill preference multiplier:
+     * - P1 (meilleure) = ×4
+     * - P2 = ×3
+     * - P3 = ×2
+     * - P4 = ×1
+     * - Pas de préférence = ×0.5
+     *
+     * Physician preference bonus (si médecin préféré présent):
+     * - P1 = +50
+     * - P2 = +30
+     * - P3 = +15
+     */
+    private int calculateMediumScore(StaffAssignment a, int base) {
+        // 1. Skill preference multiplier
+        int skillPref = a.getSkillPreference(); // 1-4, 0 if none
+        double skillMultiplier;
+        if (skillPref == 0) {
+            skillMultiplier = 0.5;
+        } else {
+            skillMultiplier = 5 - skillPref; // P1=4, P2=3, P3=2, P4=1
+        }
+
+        // 2. Physician preference bonus
+        int physicianBonus = 0;
+        Set<UUID> shiftPhysicians = a.getShift().getPhysicianIds();
+        if (shiftPhysicians != null && !shiftPhysicians.isEmpty()) {
+            int bestPriority = 0;
+            for (UUID physicianId : shiftPhysicians) {
+                int priority = a.getStaff().getPhysicianPriority(physicianId);
+                if (priority > 0 && (bestPriority == 0 || priority < bestPriority)) {
+                    bestPriority = priority;
+                }
+            }
+            // P1=50, P2=30, P3=15
+            if (bestPriority == 1) physicianBonus = 50;
+            else if (bestPriority == 2) physicianBonus = 30;
+            else if (bestPriority == 3) physicianBonus = 15;
+        }
+
+        return (int)(base * skillMultiplier) + physicianBonus;
     }
 
     // =========================================================================
@@ -245,5 +303,47 @@ public class ScheduleConstraintProvider implements ConstraintProvider {
             .reward(HardMediumSoftScore.ofSoft(1),
                 a -> 4 - a.getStaff().getSitePriority(a.getShift().getSiteId()))  // P1=3, P2=2, P3=1
             .asConstraint("S2: Site preference");
+    }
+
+    /**
+     * S3: Bonus si staff reste à la même localisation entre AM et PM.
+     * Encourage la continuité pour éviter les déplacements.
+     */
+    Constraint locationContinuity(ConstraintFactory factory) {
+        return factory.forEach(StaffAssignment.class)
+            .filter(a -> a.getPeriodId() == 1)  // AM seulement pour éviter double comptage
+            .filter(a -> !a.getShift().isRest())
+            .filter(a -> !a.getShift().isAdmin())
+            .filter(a -> a.getOtherHalfDay() != null)
+            .filter(a -> a.getOtherHalfDay().getShift() != null)
+            .filter(a -> !a.getOtherHalfDay().getShift().isRest())
+            .filter(a -> !a.getOtherHalfDay().getShift().isAdmin())
+            .filter(a -> a.getShift().getLocationId() != null)
+            .filter(a -> a.getOtherHalfDay().getShift().getLocationId() != null)
+            .filter(a -> a.getShift().getLocationId().equals(
+                         a.getOtherHalfDay().getShift().getLocationId()))
+            .reward(HardMediumSoftScore.ofSoft(10))  // Bonus pour même localisation
+            .asConstraint("S3: Location continuity");
+    }
+
+    /**
+     * S4: Pénalité si staff change de site entre AM et PM.
+     * Évite les déplacements entre sites différents dans la même journée.
+     */
+    Constraint siteChangePenalty(ConstraintFactory factory) {
+        return factory.forEach(StaffAssignment.class)
+            .filter(a -> a.getPeriodId() == 1)  // AM seulement pour éviter double comptage
+            .filter(a -> !a.getShift().isRest())
+            .filter(a -> !a.getShift().isAdmin())
+            .filter(a -> a.getOtherHalfDay() != null)
+            .filter(a -> a.getOtherHalfDay().getShift() != null)
+            .filter(a -> !a.getOtherHalfDay().getShift().isRest())
+            .filter(a -> !a.getOtherHalfDay().getShift().isAdmin())
+            .filter(a -> a.getShift().getSiteId() != null)
+            .filter(a -> a.getOtherHalfDay().getShift().getSiteId() != null)
+            .filter(a -> !a.getShift().getSiteId().equals(
+                         a.getOtherHalfDay().getShift().getSiteId()))
+            .penalize(HardMediumSoftScore.ofSoft(20))  // Pénalité pour changement de site
+            .asConstraint("S4: Site change penalty");
     }
 }
