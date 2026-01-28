@@ -8,16 +8,21 @@ import ai.timefold.solver.core.config.constructionheuristic.ConstructionHeuristi
 import ai.timefold.solver.core.config.constructionheuristic.ConstructionHeuristicType;
 import ai.timefold.solver.core.config.constructionheuristic.placer.QueuedEntityPlacerConfig;
 import ai.timefold.solver.core.config.heuristic.selector.entity.EntitySelectorConfig;
+import ai.timefold.solver.core.config.heuristic.selector.move.composite.UnionMoveSelectorConfig;
 import ai.timefold.solver.core.config.heuristic.selector.move.generic.ChangeMoveSelectorConfig;
+import ai.timefold.solver.core.config.heuristic.selector.move.generic.SwapMoveSelectorConfig;
+import ai.timefold.solver.core.config.heuristic.selector.move.generic.RuinRecreateMoveSelectorConfig;
 import ai.timefold.solver.core.config.heuristic.selector.value.ValueSelectorConfig;
 import ai.timefold.solver.core.config.localsearch.LocalSearchPhaseConfig;
 import ai.timefold.solver.core.config.localsearch.LocalSearchType;
 
 import com.scheduler.domain.ClosingAssignment;
+import com.scheduler.domain.ClosingRole;
 import com.scheduler.domain.ScheduleSolution;
-import com.scheduler.domain.StaffAssignment;
+import com.scheduler.domain.ShiftSlot;
 import com.scheduler.persistence.SupabaseRepository;
 import com.scheduler.solver.ScheduleConstraintProvider;
+import com.scheduler.solver.ShiftSlotChangeMoveFilter;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -67,8 +72,8 @@ public class App {
             log.info("Problem loaded:");
             log.info("  - {} staff members", problem.getStaffList().size());
             log.info("  - {} shifts", problem.getShifts().size());
-            log.info("  - {} assignment slots", problem.getAssignments().size());
-            log.info("  - {} closing assignments (1R/2F/3F)", problem.getClosingAssignments().size());
+            log.info("  - {} shift slots", problem.getShiftSlots().size());
+            log.info("  - {} closing assignments", problem.getClosingAssignments().size());
             log.info("  - {} locations", problem.getLocations().size());
             log.info("  - {} absences", problem.getAbsences().size());
 
@@ -88,43 +93,57 @@ public class App {
             }
 
             // Configure solver with optimized phases and termination
-            // Need separate construction heuristic phases for each entity class
+            // ShiftSlot: staff variable | ClosingAssignment: staff variable
             SolverConfig solverConfig = new SolverConfig()
                 .withSolutionClass(ScheduleSolution.class)
-                .withEntityClasses(StaffAssignment.class, ClosingAssignment.class)
+                .withEntityClasses(ShiftSlot.class, ClosingAssignment.class)
                 .withConstraintProviderClass(ScheduleConstraintProvider.class)
                 .withPhases(
-                    // Phase 1: Construction Heuristic for StaffAssignment (variable: shift)
-                    // The difficultyComparatorClass on StaffAssignment influences the order
+                    // Phase 1: Construction Heuristic for ShiftSlot (variable: staff)
+                    // ShiftSlot uses allowsUnassigned=true, so some slots may remain unassigned
+                    // Filter eliminates invalid moves (wrong skill/site/availability)
                     new ConstructionHeuristicPhaseConfig()
                         .withEntityPlacerConfig(new QueuedEntityPlacerConfig()
                             .withEntitySelectorConfig(new EntitySelectorConfig()
-                                .withEntityClass(StaffAssignment.class))
+                                .withEntityClass(ShiftSlot.class))
                             .withMoveSelectorConfigList(java.util.List.of(
                                 new ChangeMoveSelectorConfig()
                                     .withEntitySelectorConfig(new EntitySelectorConfig()
-                                        .withEntityClass(StaffAssignment.class))
+                                        .withEntityClass(ShiftSlot.class))
                                     .withValueSelectorConfig(new ValueSelectorConfig()
-                                        .withVariableName("shift"))))),
-                    // Phase 2: Construction Heuristic for ClosingAssignment (variable: staff)
+                                        .withVariableName("staff"))
+                                    .withFilterClass(ShiftSlotChangeMoveFilter.class)))),
+                    // Phase 2: Construction Heuristic for ClosingAssignment
                     new ConstructionHeuristicPhaseConfig()
                         .withEntityPlacerConfig(new QueuedEntityPlacerConfig()
                             .withEntitySelectorConfig(new EntitySelectorConfig()
-                                .withEntityClass(ClosingAssignment.class))
-                            .withMoveSelectorConfigList(java.util.List.of(
-                                new ChangeMoveSelectorConfig()
-                                    .withEntitySelectorConfig(new EntitySelectorConfig()
-                                        .withEntityClass(ClosingAssignment.class))
-                                    .withValueSelectorConfig(new ValueSelectorConfig()
-                                        .withVariableName("staff"))))),
-                    // Phase 3: Local Search with LATE_ACCEPTANCE for faster convergence
+                                .withEntityClass(ClosingAssignment.class))),
+                    // Phase 3: Local Search - optimizes both ShiftSlot.staff and ClosingAssignment.staff
                     new LocalSearchPhaseConfig()
                         .withLocalSearchType(LocalSearchType.LATE_ACCEPTANCE)
+                        .withMoveSelectorConfig(
+                            new UnionMoveSelectorConfig()
+                                .withMoveSelectorList(java.util.List.of(
+                                    // Move selector for ShiftSlot.staff variable (filtered)
+                                    new ChangeMoveSelectorConfig()
+                                        .withEntitySelectorConfig(new EntitySelectorConfig()
+                                            .withEntityClass(ShiftSlot.class))
+                                        .withValueSelectorConfig(new ValueSelectorConfig()
+                                            .withVariableName("staff"))
+                                        .withFilterClass(ShiftSlotChangeMoveFilter.class),
+                                    // Move selector for ClosingAssignment.staff variable
+                                    new ChangeMoveSelectorConfig()
+                                        .withEntitySelectorConfig(new EntitySelectorConfig()
+                                            .withEntityClass(ClosingAssignment.class))
+                                        .withValueSelectorConfig(new ValueSelectorConfig()
+                                            .withVariableName("staff"))
+                                ))
+                        )
                 )
                 .withTerminationConfig(
                     new TerminationConfig()
-                        .withSecondsSpentLimit(5L)            // Max 5 seconds total
-                        .withUnimprovedSecondsSpentLimit(2L)  // Stop if no improvement for 2s
+                        .withSecondsSpentLimit(10L)          // 10s max total
+                        .withUnimprovedSecondsSpentLimit(5L) // Stop après 5s sans amélioration
                 );
 
             // Create solver factory
@@ -136,9 +155,9 @@ public class App {
             scoreManager.update(problem);
             log.info("Initial score (all null): {}", problem.getScore());
 
-            // Count null assignments
-            long nullCount = problem.getAssignments().stream().filter(a -> a.getStaff() == null).count();
-            log.info("Null assignments: {}", nullCount);
+            // Count unassigned slots
+            long unassignedCount = problem.getShiftSlots().stream().filter(s -> s.getStaff() == null).count();
+            log.info("Unassigned ShiftSlots: {}", unassignedCount);
 
             // Create and run solver
             Solver<ScheduleSolution> solver = solverFactory.buildSolver();
@@ -158,55 +177,54 @@ public class App {
             var scoreAnalysis = scoreManager.explain(solution);
             log.info("{}", scoreAnalysis.getSummary());
 
-            // Count assignments
-            long assigned = solution.getAssignments().stream()
-                .filter(a -> a.getStaff() != null)
+            // Count slot coverage
+            long assignedSlots = solution.getShiftSlots().stream()
+                .filter(s -> s.getStaff() != null)
                 .count();
-            long unassigned = solution.getAssignments().size() - assigned;
+            long unassignedSlots = solution.getShiftSlots().size() - assignedSlots;
 
-            log.info("Assignments: {} assigned, {} unassigned", assigned, unassigned);
+            log.info("ShiftSlots: {} assigned, {} unassigned", assignedSlots, unassignedSlots);
 
-            // Print assignments by location
-            log.info("\n=== Assignments by location ===");
+            // Print slots by location
+            log.info("\n=== Slots by location ===");
             var byLoc = new java.util.HashMap<String, int[]>();
-            for (var a : solution.getAssignments()) {
-                String locName = a.getLocation() != null ? a.getLocation().getName() : "Unknown";
+            for (var slot : solution.getShiftSlots()) {
+                String locName = slot.getLocationName() != null ? slot.getLocationName() : "Unknown";
                 byLoc.computeIfAbsent(locName, k -> new int[2]);
                 byLoc.get(locName)[1]++;
-                if (a.getStaff() != null) byLoc.get(locName)[0]++;
+                if (slot.getStaff() != null) byLoc.get(locName)[0]++;
             }
             byLoc.entrySet().stream()
                 .sorted(java.util.Map.Entry.comparingByKey())
                 .forEach(e -> log.info("  {}: {}/{} assigned", e.getKey(), e.getValue()[0], e.getValue()[1]));
 
-            // Print flexible staff summary
+            // Print flexible staff summary using shadow variables
             log.info("\n=== Flexible Staff Summary ===");
             var flexStaff = solution.getStaffList().stream()
                 .filter(s -> s.isHasFlexibleSchedule())
                 .toList();
             for (var staff : flexStaff) {
-                long totalSlots = solution.getAssignments().stream()
-                    .filter(a -> a.getStaff() != null && a.getStaff().getId().equals(staff.getId()))
+                // Count work days using shadow variable
+                Integer workDays = solution.getShiftSlots().stream()
+                    .filter(s -> staff.equals(s.getStaff()))
+                    .map(ShiftSlot::getStaffWorkDayCount)
+                    .filter(c -> c != null)
+                    .findFirst()
+                    .orElse(0);
+                // Check if working full days
+                long partialDays = solution.getShiftSlots().stream()
+                    .filter(s -> staff.equals(s.getStaff()))
+                    .filter(s -> !Boolean.TRUE.equals(s.getIsWorkingFullDay()))
                     .count();
-                long restSlots = solution.getAssignments().stream()
-                    .filter(a -> a.getStaff() != null && a.getStaff().getId().equals(staff.getId()))
-                    .filter(a -> a.getShift() != null && a.getShift().isRest())
-                    .count();
-                long workSlots = totalSlots - restSlots;
-                long fullWorkDays = solution.getAssignments().stream()
-                    .filter(a -> a.getStaff() != null && a.getStaff().getId().equals(staff.getId()))
-                    .filter(a -> a.getPeriodId() == 1 && a.getShift() != null && !a.getShift().isRest())
-                    .filter(a -> a.getOtherHalfDay() != null && a.getOtherHalfDay().getShift() != null && !a.getOtherHalfDay().getShift().isRest())
-                    .count();
-                String status = (fullWorkDays == staff.getDaysPerWeek()) ? "✓ OK" : "✗ VIOLATION";
-                log.info("  {} : target={}j, slots={}, workDays={} {}",
-                    staff.getFullName(), staff.getDaysPerWeek(), totalSlots, fullWorkDays, status);
+                String status = (workDays <= staff.getDaysPerWeek() && partialDays == 0) ? "OK" : "VIOLATION";
+                log.info("  {} : target={}j, workDays={}, partialDays={} {}",
+                    staff.getFullName(), staff.getDaysPerWeek(), workDays, partialDays, status);
             }
 
-            // Print flexible staff assignments specifically
-            log.info("\n=== Flexible Staff Assignments ===");
-            solution.getAssignments().stream()
-                .filter(a -> a.getStaff() != null && a.getStaff().isHasFlexibleSchedule())
+            // Print flexible staff slot assignments
+            log.info("\n=== Flexible Staff Slot Assignments ===");
+            solution.getShiftSlots().stream()
+                .filter(s -> s.getStaff() != null && s.getStaff().isHasFlexibleSchedule())
                 .sorted((a, b) -> {
                     int cmp = a.getStaff().getFullName().compareTo(b.getStaff().getFullName());
                     if (cmp != 0) return cmp;
@@ -214,141 +232,97 @@ public class App {
                     if (cmp != 0) return cmp;
                     return a.getPeriodId() - b.getPeriodId();
                 })
-                .forEach(a -> {
-                    String shiftType = "?";
-                    if (a.getShift() != null) {
-                        if (a.getShift().isRest()) shiftType = "REST";
-                        else if (a.getShift().isAdmin()) shiftType = "ADMIN";
-                        else shiftType = a.getShift().getNeedType();
-                    }
-                    String pair = a.getOtherHalfDay() != null ? "✓" : "✗NO-PAIR";
-                    log.info("  {} ({}j) -> {} {} : {} @ {} [{}]",
-                        a.getStaff().getFullName(),
-                        a.getStaff().getDaysPerWeek(),
-                        a.getDate(),
-                        a.getPeriodId() == 1 ? "AM" : "PM",
-                        shiftType,
-                        a.getLocation() != null ? a.getLocation().getName() : "-",
-                        pair);
+                .forEach(s -> {
+                    String fullDay = Boolean.TRUE.equals(s.getIsWorkingFullDay()) ? "FULL" : "PARTIAL";
+                    log.info("  {} ({}j, workDays={}) -> {} {} : {} @ {} [{}]",
+                        s.getStaff().getFullName(),
+                        s.getStaff().getDaysPerWeek(),
+                        s.getStaffWorkDayCount(),
+                        s.getDate(),
+                        s.getPeriodId() == 1 ? "AM" : "PM",
+                        s.getNeedType(),
+                        s.getLocationName() != null ? s.getLocationName() : "-",
+                        fullDay);
                 });
 
             // Print some details
-            log.info("\n=== Assignments (first 30) ===");
-            solution.getAssignments().stream()
-                .filter(a -> a.getStaff() != null)
+            log.info("\n=== ShiftSlots (first 30) ===");
+            solution.getShiftSlots().stream()
+                .filter(s -> s.getStaff() != null)
                 .limit(30) // Show first 30
-                .forEach(a -> log.info("  {} -> {} {} @ {}",
-                    a.getStaff().getFullName(),
-                    a.getDate(),
-                    a.getPeriodId() == 1 ? "AM" : "PM",
-                    a.getLocation() != null ? a.getLocation().getName() : a.getLocationId()));
+                .forEach(s -> log.info("  {} -> {} {} @ {}",
+                    s.getStaff().getFullName(),
+                    s.getDate(),
+                    s.getPeriodId() == 1 ? "AM" : "PM",
+                    s.getLocationName()));
 
-            // Analyze uncovered shifts
-            log.info("\n=== Uncovered Shifts Analysis ===");
-            var shiftCoverage = new java.util.HashMap<com.scheduler.domain.Shift, Integer>();
-            for (var shift : solution.getShifts()) {
-                shiftCoverage.put(shift, 0);
-            }
-            for (var a : solution.getAssignments()) {
-                if (a.getShift() != null) {
-                    shiftCoverage.merge(a.getShift(), 1, Integer::sum);
-                }
-            }
-
-            // Show uncovered or partially covered shifts (excluding REST only)
-            var uncoveredShifts = shiftCoverage.entrySet().stream()
-                .filter(e -> !e.getKey().isRest())
-                .filter(e -> e.getValue() < e.getKey().getQuantityNeeded())
-                .sorted((a, b) -> {
-                    int cmp = a.getKey().getDate().compareTo(b.getKey().getDate());
-                    if (cmp != 0) return cmp;
-                    return Integer.compare(a.getKey().getPeriodId(), b.getKey().getPeriodId());
-                })
+            // Analyze unassigned slots
+            log.info("\n=== Unassigned Slots Analysis ===");
+            var unassignedSlotsList = solution.getShiftSlots().stream()
+                .filter(s -> s.getStaff() == null)
                 .toList();
 
             // Count by type
-            long uncoveredConsultation = uncoveredShifts.stream()
-                .filter(e -> "consultation".equals(e.getKey().getNeedType()))
-                .mapToInt(e -> e.getKey().getQuantityNeeded() - e.getValue())
-                .sum();
-            long uncoveredSurgical = uncoveredShifts.stream()
-                .filter(e -> "surgical".equals(e.getKey().getNeedType()))
-                .mapToInt(e -> e.getKey().getQuantityNeeded() - e.getValue())
-                .sum();
-            long uncoveredAdmin = uncoveredShifts.stream()
-                .filter(e -> e.getKey().isAdmin())
-                .mapToInt(e -> e.getKey().getQuantityNeeded() - e.getValue())
-                .sum();
+            long unassignedConsultation = unassignedSlotsList.stream()
+                .filter(ShiftSlot::isConsultation)
+                .count();
+            long unassignedSurgical = unassignedSlotsList.stream()
+                .filter(ShiftSlot::isSurgical)
+                .count();
 
-            // Closing analysis (from ClosingAssignment entities)
-            long closingTotal = solution.getClosingAssignments().size();
-            long closingAssigned = solution.getClosingAssignments().stream()
+            // Closing analysis (ClosingAssignment entity)
+            var closingAssignments = solution.getClosingAssignments();
+            long closingAssigned = closingAssignments.stream()
                 .filter(ca -> ca.getStaff() != null)
                 .count();
-            log.info("Closing analysis: {} closing assignments, {} assigned to staff",
-                closingTotal, closingAssigned);
+            log.info("Closing analysis: {} closing assignments, {} with staff",
+                closingAssignments.size(), closingAssigned);
 
-            // Diagnostic: For each closing location/date, how many staff work ALL DAY there?
-            log.info("\n=== Closing Location Diagnostic ===");
-            var closingLocationDates = solution.getClosingAssignments().stream()
+            // Diagnostic: For each location/date, show closing roles status
+            log.info("\n=== Closing Assignments Diagnostic ===");
+            var closingByLocationDate = closingAssignments.stream()
                 .collect(java.util.stream.Collectors.groupingBy(
                     ca -> ca.getLocationId() + "|" + ca.getDate() + "|" + ca.getLocationName()));
-            for (var entry : closingLocationDates.entrySet()) {
+            for (var entry : closingByLocationDate.entrySet()) {
                 String[] parts = entry.getKey().split("\\|");
                 UUID locId = UUID.fromString(parts[0]);
                 LocalDate date = LocalDate.parse(parts[1]);
                 String locName = parts[2];
 
-                // Find staff who work AM and PM at this location on this date
-                var staffAtLocAM = solution.getAssignments().stream()
-                    .filter(a -> a.getShift() != null && !a.getShift().isAdmin() && !a.getShift().isRest())
-                    .filter(a -> a.getDate().equals(date) && a.getPeriodId() == 1)
-                    .filter(a -> locId.equals(a.getLocationId()))
-                    .map(a -> a.getStaff().getId())
-                    .collect(java.util.stream.Collectors.toSet());
+                var caAtLoc = entry.getValue();
+                long assignedAtLoc = caAtLoc.stream().filter(ca -> ca.getStaff() != null).count();
 
-                var staffAtLocPM = solution.getAssignments().stream()
-                    .filter(a -> a.getShift() != null && !a.getShift().isAdmin() && !a.getShift().isRest())
-                    .filter(a -> a.getDate().equals(date) && a.getPeriodId() == 2)
-                    .filter(a -> locId.equals(a.getLocationId()))
-                    .map(a -> a.getStaff().getId())
-                    .collect(java.util.stream.Collectors.toSet());
-
-                // Staff who work ALL DAY = intersection of AM and PM
-                var allDayStaff = new java.util.HashSet<>(staffAtLocAM);
-                allDayStaff.retainAll(staffAtLocPM);
-
-                log.info("  {} @ {} (loc={}): {} staff work AM, {} staff work PM, {} work ALL DAY",
+                log.info("  {} @ {} (loc={}): {} closing assignments, {} with staff",
                     date, locName, locId.toString().substring(0, 8),
-                    staffAtLocAM.size(), staffAtLocPM.size(), allDayStaff.size());
+                    caAtLoc.size(), assignedAtLoc);
 
-                // Show who works all day
-                if (!allDayStaff.isEmpty()) {
-                    var allDayNames = solution.getStaffList().stream()
-                        .filter(s -> allDayStaff.contains(s.getId()))
-                        .map(s -> s.getFullName())
-                        .toList();
-                    log.info("    All-day staff: {}", allDayNames);
-                }
+                // Show who has closing role
+                caAtLoc.stream()
+                    .filter(ca -> ca.getStaff() != null)
+                    .forEach(ca -> log.info("    {} -> {}",
+                        ca.getRole().getDisplayName(),
+                        ca.getStaff().getFullName()));
             }
-            // Show closing assignments details
-            if (!solution.getClosingAssignments().isEmpty()) {
+
+            // Show closing assignments
+            if (!closingAssignments.isEmpty()) {
                 log.info("Closing assignments:");
-                solution.getClosingAssignments().stream()
+                closingAssignments.stream()
                     .sorted((a, b) -> {
                         int cmp = a.getDate().compareTo(b.getDate());
                         if (cmp != 0) return cmp;
                         return a.getRole().compareTo(b.getRole());
                     })
                     .limit(20)
-                    .forEach(ca -> log.info("  {} {} @ {} (loc={}) -> {}",
-                        ca.getDate(), ca.getRole().getDisplayName(), ca.getLocationName(),
-                        ca.getLocationId(),
+                    .forEach(ca -> log.info("  {} {} @ {} -> {}",
+                        ca.getDate(),
+                        ca.getRole().getDisplayName(),
+                        ca.getLocationName(),
                         ca.getStaff() != null ? ca.getStaff().getFullName() : "UNASSIGNED"));
 
                 // Log closing count per staff (for balance monitoring)
                 log.info("\n=== Closing Balance par Staff ===");
-                var closingByStaff = solution.getClosingAssignments().stream()
+                var closingByStaff = closingAssignments.stream()
                     .filter(ca -> ca.getStaff() != null)
                     .collect(java.util.stream.Collectors.groupingBy(
                         ca -> ca.getStaff().getFullName(),
@@ -356,42 +330,38 @@ public class App {
                 closingByStaff.entrySet().stream()
                     .sorted((a, b) -> Long.compare(b.getValue(), a.getValue()))
                     .forEach(e -> {
-                        String warning = e.getValue() > 2 ? " ⚠️ TROP DE CLOSING!" : "";
-                        log.info("  {}: {} jours de closing{}", e.getKey(), e.getValue(), warning);
+                        String warning = e.getValue() > 2 ? " TROP DE CLOSING!" : "";
+                        log.info("  {}: {} closing{}", e.getKey(), e.getValue(), warning);
                     });
 
-                // Total closing assignments and staff with closing
-                int totalClosing = solution.getClosingAssignments().size();
+                // Total closing and staff with closing
                 int staffWithClosing = closingByStaff.size();
-                double avgClosingPerStaff = staffWithClosing > 0 ? (double)totalClosing / staffWithClosing : 0;
-                log.info("  Total: {} closing, {} staff, moyenne: {:.1f} par staff",
-                    totalClosing, staffWithClosing, avgClosingPerStaff);
+                double avgClosingPerStaff = staffWithClosing > 0 ? (double) closingAssignments.size() / staffWithClosing : 0;
+                log.info("  Total: {} closing assignments, {} staff, moyenne: {} par staff",
+                    closingAssignments.size(), staffWithClosing, String.format("%.1f", avgClosingPerStaff));
             }
 
-            if (uncoveredShifts.isEmpty()) {
-                log.info("All shifts are fully covered!");
+            // Analyze unassigned ShiftSlots (replacing old uncovered shifts analysis)
+            if (unassignedSlots == 0) {
+                log.info("All ShiftSlots are fully covered!");
             } else {
-                log.info("Found {} uncovered/partially covered shifts:", uncoveredShifts.size());
-                log.info("  Uncovered by type: consultation={}, surgical={}, admin={}",
-                    uncoveredConsultation, uncoveredSurgical, uncoveredAdmin);
-                for (var entry : uncoveredShifts) {
-                    var shift = entry.getKey();
-                    if (shift.isAdmin()) continue; // Skip admin in detailed list
-                    int covered = entry.getValue();
-                    int needed = shift.getQuantityNeeded();
-                    String locName = shift.getLocationName() != null ? shift.getLocationName() : "Unknown";
-                    String skillName = shift.getSkillName() != null ? shift.getSkillName() : "Unknown";
-                    String period = shift.getPeriodId() == 1 ? "AM" : "PM";
-                    log.info("  {} {} {} @ {} [{}]: {}/{} covered (missing {})",
-                        shift.getDate(), period, shift.getNeedType(),
-                        locName, skillName,
-                        covered, needed, needed - covered);
-                }
+                log.info("Found {} unassigned ShiftSlots:", unassignedSlots);
+                log.info("  Unassigned by type: consultation={}, surgical={}",
+                    unassignedConsultation, unassignedSurgical);
+                // Show first 20 unassigned slots
+                unassignedSlotsList.stream().limit(20).forEach(slot -> {
+                    String locName = slot.getLocationName() != null ? slot.getLocationName() : "Unknown";
+                    String skillName = slot.getSkillName() != null ? slot.getSkillName() : "Unknown";
+                    String period = slot.getPeriodId() == 1 ? "AM" : "PM";
+                    log.info("  {} {} {} @ {} [{}] - UNASSIGNED",
+                        slot.getDate(), period, slot.getNeedType(),
+                        locName, skillName);
+                });
             }
 
             // Save results to Supabase (commented out for testing)
             // UUID solverRunId = UUID.randomUUID();
-            // repository.saveAssignments(solution.getAssignments(), solution.getClosingAssignments(), solverRunId);
+            // repository.saveAssignments(solution.getShiftSlots(), solverRunId);
             // log.info("Results saved with solver_run_id: {}", solverRunId);
 
             // Generate HTML report

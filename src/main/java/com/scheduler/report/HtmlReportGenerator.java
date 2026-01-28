@@ -94,11 +94,11 @@ public class HtmlReportGenerator {
             scoreClass = "bad";
         }
 
-        long totalAssignments = solution.getAssignments().size();
-        long assignedCount = solution.getAssignments().stream()
-            .filter(a -> a.getShift() != null && !a.getShift().isRest())
+        long totalSlots = solution.getShiftSlots().size();
+        long assignedCount = solution.getShiftSlots().stream()
+            .filter(s -> s.getStaff() != null)
             .count();
-        long closingTotal = solution.getClosingAssignments().size();
+        // Count closing assignments with staff (from ClosingAssignment entity)
         long closingAssigned = solution.getClosingAssignments().stream()
             .filter(ca -> ca.getStaff() != null)
             .count();
@@ -111,7 +111,7 @@ public class HtmlReportGenerator {
         sb.append("<div class=\"score-stats\">\n");
         sb.append("<div class=\"stat-item\"><span class=\"stat-number\">").append(solution.getStaffList().size()).append("</span><span class=\"stat-label\">Staff</span></div>\n");
         sb.append("<div class=\"stat-item\"><span class=\"stat-number\">").append(assignedCount).append("</span><span class=\"stat-label\">Assignations</span></div>\n");
-        sb.append("<div class=\"stat-item\"><span class=\"stat-number\">").append(closingAssigned).append("/").append(closingTotal).append("</span><span class=\"stat-label\">Closing</span></div>\n");
+        sb.append("<div class=\"stat-item\"><span class=\"stat-number\">").append(closingAssigned).append("</span><span class=\"stat-label\">Closing</span></div>\n");
         sb.append("</div>\n");
         sb.append("</div>\n");
 
@@ -179,14 +179,14 @@ public class HtmlReportGenerator {
             staffStats.get(staff).put("closing", 0);
         }
 
-        // Count assignments
+        // Count assignments from ShiftSlots
         Set<String> porrentruyDays = new HashSet<>();
-        for (StaffAssignment a : solution.getAssignments()) {
-            if (a.getShift() == null || a.getStaff() == null) continue;
-            Map<String, Integer> stats = staffStats.get(a.getStaff());
+        for (ShiftSlot slot : solution.getShiftSlots()) {
+            if (slot.getStaff() == null || slot.getShift() == null) continue;
+            Map<String, Integer> stats = staffStats.get(slot.getStaff());
             if (stats == null) continue;
 
-            Shift shift = a.getShift();
+            Shift shift = slot.getShift();
             if (shift.isAdmin()) {
                 stats.merge("admin", 1, Integer::sum);
             } else if ("surgical".equals(shift.getNeedType())) {
@@ -196,7 +196,7 @@ public class HtmlReportGenerator {
             }
 
             if (PORRENTRUY_SITE_ID.equals(shift.getSiteId())) {
-                String key = a.getStaff().getId() + "|" + a.getDate();
+                String key = slot.getStaff().getId() + "|" + slot.getDate();
                 if (!porrentruyDays.contains(key)) {
                     porrentruyDays.add(key);
                     stats.merge("porrentruy", 1, Integer::sum);
@@ -204,13 +204,12 @@ public class HtmlReportGenerator {
             }
         }
 
-        // Count closing
+        // Count closing from ClosingAssignment entity
         for (ClosingAssignment ca : solution.getClosingAssignments()) {
-            if (ca.getStaff() != null) {
-                Map<String, Integer> stats = staffStats.get(ca.getStaff());
-                if (stats != null) {
-                    stats.merge("closing", 1, Integer::sum);
-                }
+            if (ca.getStaff() == null) continue;
+            Map<String, Integer> stats = staffStats.get(ca.getStaff());
+            if (stats != null) {
+                stats.merge("closing", 1, Integer::sum);
             }
         }
 
@@ -264,44 +263,45 @@ public class HtmlReportGenerator {
         sb.append("<script>\n");
 
         // Collect data for charts
-        // Closing data
+        // Closing data (from ClosingAssignment entity)
         Map<String, int[]> closingByStaff = new LinkedHashMap<>(); // [1R count, 2F count]
         for (ClosingAssignment ca : solution.getClosingAssignments()) {
-            if (ca.getStaff() != null) {
+            ClosingRole role = ca.getRole();
+            if (role != null && ca.getStaff() != null) {
                 String name = ca.getStaff().getFullName();
                 closingByStaff.computeIfAbsent(name, k -> new int[2]);
-                if (ca.getRole() == ClosingRole.ROLE_1R) {
+                if (role == ClosingRole.ROLE_1R) {
                     closingByStaff.get(name)[0]++;
-                } else if (ca.getRole() == ClosingRole.ROLE_2F) {
+                } else if (role == ClosingRole.ROLE_2F) {
                     closingByStaff.get(name)[1]++;
                 }
             }
         }
 
         // Admin data
-        Map<String, Long> adminByStaff = solution.getAssignments().stream()
-            .filter(a -> a.getShift() != null && a.getShift().isAdmin())
+        Map<String, Long> adminByStaff = solution.getShiftSlots().stream()
+            .filter(s -> s.getStaff() != null && s.getShift() != null && s.getShift().isAdmin())
             .collect(Collectors.groupingBy(
-                a -> a.getStaff().getFullName(),
+                s -> s.getStaff().getFullName(),
                 Collectors.counting()));
 
         // Porrentruy data (count DAYS, not half-days)
         Map<String, Set<LocalDate>> porrentruyDaysByStaff = new LinkedHashMap<>();
-        for (StaffAssignment a : solution.getAssignments()) {
-            if (a.getShift() != null && PORRENTRUY_SITE_ID.equals(a.getShift().getSiteId())) {
-                String name = a.getStaff().getFullName();
-                porrentruyDaysByStaff.computeIfAbsent(name, k -> new HashSet<>()).add(a.getDate());
+        for (ShiftSlot slot : solution.getShiftSlots()) {
+            if (slot.getStaff() != null && slot.getShift() != null && PORRENTRUY_SITE_ID.equals(slot.getShift().getSiteId())) {
+                String name = slot.getStaff().getFullName();
+                porrentruyDaysByStaff.computeIfAbsent(name, k -> new HashSet<>()).add(slot.getDate());
             }
         }
         Map<String, Integer> porrentruyByStaff = new LinkedHashMap<>();
         porrentruyDaysByStaff.forEach((name, days) -> porrentruyByStaff.put(name, days.size()));
 
         // Sites data
-        Map<String, Long> assignmentsBySite = solution.getAssignments().stream()
-            .filter(a -> a.getShift() != null && !a.getShift().isRest() && !a.getShift().isAdmin())
-            .filter(a -> a.getShift().getSiteName() != null)
+        Map<String, Long> assignmentsBySite = solution.getShiftSlots().stream()
+            .filter(s -> s.getStaff() != null && s.getShift() != null && !s.getShift().isRest() && !s.getShift().isAdmin())
+            .filter(s -> s.getShift().getSiteName() != null)
             .collect(Collectors.groupingBy(
-                a -> a.getShift().getSiteName(),
+                s -> s.getShift().getSiteName(),
                 Collectors.counting()));
 
         // Closing Chart (Horizontal Bar)
@@ -384,17 +384,17 @@ public class HtmlReportGenerator {
                                              LocalDate endDate) {
         StringBuilder grid = new StringBuilder();
 
-        // Group assignments by staff
-        Map<Staff, List<StaffAssignment>> byStaff = solution.getAssignments().stream()
-            .filter(a -> a.getStaff() != null)
-            .collect(Collectors.groupingBy(StaffAssignment::getStaff));
+        // Group slots by staff
+        Map<Staff, List<ShiftSlot>> byStaff = solution.getShiftSlots().stream()
+            .filter(s -> s.getStaff() != null)
+            .collect(Collectors.groupingBy(ShiftSlot::getStaff));
 
-        // Build closing lookup map
-        Map<String, Set<String>> closingMap = new HashMap<>();
+        // Build closing map: staff+location+date -> ClosingRole
+        Map<String, ClosingRole> closingMap = new HashMap<>();
         for (ClosingAssignment ca : solution.getClosingAssignments()) {
             if (ca.getStaff() != null) {
                 String key = ca.getStaff().getId() + "|" + ca.getLocationId() + "|" + ca.getDate();
-                closingMap.computeIfAbsent(key, k -> new HashSet<>()).add(ca.getRole().getDisplayName());
+                closingMap.put(key, ca.getRole());
             }
         }
 
@@ -425,18 +425,30 @@ public class HtmlReportGenerator {
             grid.append("<tr>\n");
             grid.append("<td class=\"staff-name\">").append(escapeHtml(staff.getFullName())).append("</td>\n");
 
-            Map<String, StaffAssignment> assignmentMap = byStaff.get(staff).stream()
+            Map<String, ShiftSlot> slotMap = byStaff.get(staff).stream()
                 .collect(Collectors.toMap(
-                    a -> a.getDate() + "|" + a.getPeriodId(),
-                    a -> a,
-                    (a1, a2) -> a1));
+                    s -> s.getDate() + "|" + s.getPeriodId(),
+                    s -> s,
+                    (s1, s2) -> s1));
 
             for (LocalDate date : dates) {
                 grid.append("<td class=\"day-cell\">\n");
-                StaffAssignment am = assignmentMap.get(date + "|1");
-                grid.append(formatAssignment(am, "am", closingMap));
-                StaffAssignment pm = assignmentMap.get(date + "|2");
-                grid.append(formatAssignment(pm, "pm", closingMap));
+
+                // Check for full-day closing slot (periodId=0)
+                ShiftSlot fullDay = slotMap.get(date + "|0");
+                if (fullDay != null) {
+                    // Full-day closing slot spans both AM and PM
+                    grid.append(formatSlot(fullDay, "closing-fullday", closingMap));
+                } else {
+                    // AM slot
+                    ShiftSlot am = slotMap.get(date + "|1");
+                    grid.append(formatSlot(am, "am", closingMap));
+
+                    // PM slot
+                    ShiftSlot pm = slotMap.get(date + "|2");
+                    grid.append(formatSlot(pm, "pm", closingMap));
+                }
+
                 grid.append("</td>\n");
             }
             grid.append("</tr>\n");
@@ -446,22 +458,23 @@ public class HtmlReportGenerator {
         return grid.toString();
     }
 
-    private static String formatAssignment(StaffAssignment a, String periodClass, Map<String, Set<String>> closingMap) {
-        if (a == null || a.getShift() == null) {
+    private static String formatSlot(ShiftSlot slot, String periodClass, Map<String, ClosingRole> closingMap) {
+        if (slot == null || slot.getShift() == null) {
             return "<div class=\"slot " + periodClass + " empty\">-</div>\n";
         }
 
-        Shift shift = a.getShift();
+        Shift shift = slot.getShift();
         String typeClass = getTypeClass(shift);
         String label = getLabel(shift);
         String tooltip = getTooltip(shift);
 
+        // Check if this staff has a closing role at this location/date
         String closingBadge = "";
-        if (a.getStaff() != null && shift.getLocationId() != null) {
-            String key = a.getStaff().getId() + "|" + shift.getLocationId() + "|" + a.getDate();
-            Set<String> roles = closingMap.get(key);
-            if (roles != null && !roles.isEmpty()) {
-                closingBadge = " <span class=\"closing-badge\">[" + String.join(",", roles) + "]</span>";
+        if (slot.getStaff() != null && slot.getLocationId() != null) {
+            String closingKey = slot.getStaff().getId() + "|" + slot.getLocationId() + "|" + slot.getDate();
+            ClosingRole closingRole = closingMap.get(closingKey);
+            if (closingRole != null) {
+                closingBadge = " <span class=\"closing-badge\">[" + closingRole.getDisplayName() + "]</span>";
             }
         }
 
@@ -481,12 +494,9 @@ public class HtmlReportGenerator {
         if (shift.isRest()) return "REPOS";
         if (shift.isAdmin()) return "Admin";
         if (shift.isClosingShift()) {
-            StringBuilder sb = new StringBuilder();
-            sb.append(shift.getClosingRole());
-            if (shift.getLocationName() != null) {
-                sb.append(" @ ").append(truncate(shift.getLocationName(), 12));
-            }
-            return sb.toString();
+            // For full-day closing shifts, show "CLOSING" + location
+            String loc = shift.getLocationName() != null ? truncate(shift.getLocationName(), 10) : "";
+            return "CLOSING @ " + loc;
         }
 
         StringBuilder sb = new StringBuilder();
@@ -529,18 +539,18 @@ public class HtmlReportGenerator {
         Map<String, Map<LocalDate, Map<Integer, List<String>>>> siteStaffMap = new LinkedHashMap<>();
         Map<String, Map<LocalDate, Map<Integer, Set<String>>>> sitePhysicianMap = new LinkedHashMap<>();
 
-        for (StaffAssignment a : solution.getAssignments()) {
-            if (a.getShift() == null || a.getShift().isRest() || a.getShift().isAdmin()) continue;
+        for (ShiftSlot slot : solution.getShiftSlots()) {
+            if (slot.getStaff() == null || slot.getShift() == null || slot.getShift().isRest() || slot.getShift().isAdmin()) continue;
 
-            Shift shift = a.getShift();
+            Shift shift = slot.getShift();
             String siteName = shift.getSiteName() != null ? shift.getSiteName() : "Autre";
-            LocalDate date = a.getDate();
-            int period = a.getPeriodId();
+            LocalDate date = slot.getDate();
+            int period = slot.getPeriodId();
 
             siteStaffMap.computeIfAbsent(siteName, k -> new LinkedHashMap<>())
                 .computeIfAbsent(date, k -> new LinkedHashMap<>())
                 .computeIfAbsent(period, k -> new ArrayList<>())
-                .add(a.getStaff().getFullName());
+                .add(slot.getStaff().getFullName());
 
             if (shift.getPhysicianNames() != null && !shift.getPhysicianNames().isEmpty()) {
                 String[] physicians = shift.getPhysicianNames().split(",\\s*");
@@ -592,6 +602,7 @@ public class HtmlReportGenerator {
     private static String buildClosingSection(ScheduleSolution solution) {
         StringBuilder sb = new StringBuilder();
 
+        // Get closing assignments (ClosingAssignment entity)
         List<ClosingAssignment> closingAssignments = solution.getClosingAssignments();
         if (closingAssignments.isEmpty()) return "";
 
@@ -601,7 +612,7 @@ public class HtmlReportGenerator {
         Map<LocalDate, List<ClosingAssignment>> byDate = closingAssignments.stream()
             .sorted(Comparator.comparing(ClosingAssignment::getDate)
                 .thenComparing(ca -> ca.getLocationName() != null ? ca.getLocationName() : "")
-                .thenComparing(ca -> ca.getRole().ordinal()))
+                .thenComparing(ca -> ca.getRole() != null ? ca.getRole().ordinal() : 99))
             .collect(Collectors.groupingBy(ClosingAssignment::getDate, LinkedHashMap::new, Collectors.toList()));
 
         sb.append("<table class=\"closing-table\">\n");
@@ -611,13 +622,15 @@ public class HtmlReportGenerator {
             LocalDate date = entry.getKey();
             for (ClosingAssignment ca : entry.getValue()) {
                 String statusClass = ca.getStaff() != null ? "assigned" : "unassigned";
-                String staffName = ca.getStaff() != null ? ca.getStaff().getFullName() : "⚠️ NON ASSIGNÉ";
+                String staffName = ca.getStaff() != null ? ca.getStaff().getFullName() : "NON ASSIGNE";
+                ClosingRole role = ca.getRole();
+                String roleDisplay = role != null ? role.getDisplayName() : "?";
 
                 sb.append("<tr class=\"").append(statusClass).append("\">\n");
                 sb.append("<td>").append(date.format(DATE_FORMATTER)).append("</td>\n");
                 sb.append("<td>").append(escapeHtml(ca.getLocationName())).append("</td>\n");
-                sb.append("<td><span class=\"role-badge ").append(ca.getRole().getDisplayName().toLowerCase()).append("\">")
-                  .append(ca.getRole().getDisplayName()).append("</span></td>\n");
+                sb.append("<td><span class=\"role-badge ").append(roleDisplay.toLowerCase()).append("\">")
+                  .append(roleDisplay).append("</span></td>\n");
                 sb.append("<td>").append(escapeHtml(staffName)).append("</td>\n");
                 sb.append("</tr>\n");
             }
@@ -630,13 +643,14 @@ public class HtmlReportGenerator {
     private static String buildUncoveredShifts(ScheduleSolution solution) {
         StringBuilder sb = new StringBuilder();
 
+        // With ShiftSlot model: count assigned slots per shift
         Map<Shift, Integer> shiftCoverage = new HashMap<>();
         for (Shift shift : solution.getShifts()) {
             shiftCoverage.put(shift, 0);
         }
-        for (StaffAssignment a : solution.getAssignments()) {
-            if (a.getShift() != null) {
-                shiftCoverage.merge(a.getShift(), 1, Integer::sum);
+        for (ShiftSlot slot : solution.getShiftSlots()) {
+            if (slot.getStaff() != null && slot.getShift() != null) {
+                shiftCoverage.merge(slot.getShift(), 1, Integer::sum);
             }
         }
 
@@ -876,6 +890,7 @@ public class HtmlReportGenerator {
             }
             .slot.am { border-left: 3px solid #2196F3; }
             .slot.pm { border-left: 3px solid #FF9800; }
+            .slot.closing-fullday { border-left: 3px solid #c62828; background: #ffebee; color: #c62828; font-weight: 600; }
             .consultation { background: #e3f2fd; color: #1565c0; }
             .surgical { background: #fff3e0; color: #e65100; }
             .admin { background: #f5f5f5; color: #757575; }

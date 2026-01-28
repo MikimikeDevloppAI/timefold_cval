@@ -16,10 +16,10 @@ import java.util.UUID;
 /**
  * The main planning solution containing all data and assignments.
  *
- * INVERTED MODEL:
- * - Staff is fixed in StaffAssignment (one assignment per available staff/date/period)
- * - Shift is the @PlanningVariable (Timefold chooses which shift to assign)
- * - @ValueRangeProvider is on shifts (the pool of possible shifts)
+ * MODEL:
+ * - ShiftSlot: 1 slot = 1 unit of coverage (staff @PlanningVariable)
+ * - ClosingAssignment: 1 closing responsibility per location/date/role
+ *   (staff @PlanningVariable - separate from ShiftSlot)
  */
 @PlanningSolution
 public class ScheduleSolution {
@@ -28,9 +28,8 @@ public class ScheduleSolution {
     @ProblemFactCollectionProperty
     private List<Staff> staffList = new ArrayList<>();
 
-    // Shifts are the value range for StaffAssignment.shift
+    // Shifts define what needs to be covered (parent of ShiftSlot)
     @ProblemFactCollectionProperty
-    @ValueRangeProvider(id = "shiftRange")
     private List<Shift> shifts = new ArrayList<>();
 
     @ProblemFactCollectionProperty
@@ -39,20 +38,25 @@ public class ScheduleSolution {
     @ProblemFactCollectionProperty
     private List<Absence> absences = new ArrayList<>();
 
-    // Planning entities (assignments to be optimized)
+    // ShiftSlots - 1 slot = 1 unit of coverage
+    // Each slot can be assigned to one staff member (or left unassigned if overconstrained)
     @PlanningEntityCollectionProperty
-    private List<StaffAssignment> assignments = new ArrayList<>();
+    private List<ShiftSlot> shiftSlots = new ArrayList<>();
 
-    // Closing assignments - planning entities for closing responsibilities (1R, 2F)
-    // The solver assigns staff members to these closing roles
+    // ClosingAssignments - 1 per location/date/role (1R, 2F)
+    // Staff assigned here must also work at that location on that date
     @PlanningEntityCollectionProperty
     private List<ClosingAssignment> closingAssignments = new ArrayList<>();
 
-    // Value range for ClosingAssignment.staff (reuses staffList)
+    // Value range for ShiftSlot.staff
+    // Note: Le filtrage des candidats invalides est fait via ShiftSlotChangeMoveFilter
     @ValueRangeProvider(id = "staffRange")
     public List<Staff> getStaffRange() {
         return staffList;
     }
+
+    // NOTE: closingRoleRange removed - closingRole is no longer on ShiftSlot
+    // ClosingAssignment.staff uses staffRange
 
     // Score
     @PlanningScore
@@ -110,8 +114,8 @@ public class ScheduleSolution {
     public List<Absence> getAbsences() { return absences; }
     public void setAbsences(List<Absence> absences) { this.absences = absences; }
 
-    public List<StaffAssignment> getAssignments() { return assignments; }
-    public void setAssignments(List<StaffAssignment> assignments) { this.assignments = assignments; }
+    public List<ShiftSlot> getShiftSlots() { return shiftSlots; }
+    public void setShiftSlots(List<ShiftSlot> shiftSlots) { this.shiftSlots = shiftSlots; }
 
     public List<ClosingAssignment> getClosingAssignments() { return closingAssignments; }
     public void setClosingAssignments(List<ClosingAssignment> closingAssignments) { this.closingAssignments = closingAssignments; }

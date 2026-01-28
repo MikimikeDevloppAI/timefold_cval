@@ -8,8 +8,8 @@ import ai.timefold.solver.core.api.score.stream.ConstraintProvider;
 import ai.timefold.solver.core.api.score.stream.Joiners;
 
 import com.scheduler.domain.ClosingAssignment;
-import com.scheduler.domain.Shift;
-import com.scheduler.domain.StaffAssignment;
+import com.scheduler.domain.ClosingRole;
+import com.scheduler.domain.ShiftSlot;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -19,10 +19,9 @@ import java.util.UUID;
 /**
  * Contraintes du staff scheduler.
  *
- * MODÈLE REST SHIFTS:
- * - nullable=false sur @PlanningVariable - le solver DOIT assigner un shift
- * - Shifts REST synthétiques pour les jours de repos des staff flexibles
- * - forEach() suffit car shift n'est jamais null (REST est un vrai shift)
+ * MODÈLE:
+ * - ShiftSlot: 1 slot = 1 unit of coverage (staff @PlanningVariable)
+ * - ClosingAssignment: 1 per location/date/role (staff @PlanningVariable)
  *
  * HARD: Faisabilité (doit être 0)
  * MEDIUM: Couverture des shifts
@@ -36,314 +35,326 @@ public class ScheduleConstraintProvider implements ConstraintProvider {
     public Constraint[] defineConstraints(ConstraintFactory factory) {
         log.info("=== ScheduleConstraintProvider.defineConstraints() ===");
         return new Constraint[] {
-            // HARD - faisabilité
-            nonFlexibleMustWork(factory),   // H11: Staff non-flexible ne peut pas avoir REST
-            flexibleMixedDays(factory),     // H12: Flexible ne peut pas avoir de jours mixtes (AM REST ≠ PM REST)
-            flexibleMinRestSlots(factory),  // H13: Flexible doit avoir assez de slots REST (évalué pendant CH)
-            flexibleExactDays(factory),     // H6: Flexible doit avoir exactement N jours
-            skillEligibility(factory),      // H1: Skill requis
-            siteEligibility(factory),       // H2: Site requis
-            shiftCapacity(factory),         // H9b: Capacité max
+            // =====================================================================
+            // SHIFT SLOT CONSTRAINTS
+            // =====================================================================
 
-            // MEDIUM - couverture (bonus pour shifts couverts)
-            coveredSurgical(factory),
-            coveredConsultation(factory),
+            // HARD - ShiftSlot feasibility
+            // HS1, HS2, HS3: SUPPRIMÉS - filtrés via ShiftSlotChangeMoveFilter
+            slotNoDoubleBooking(factory),      // HS4: Staff can't work two slots at same time
 
-            // SOFT - préférences
-            skillPreference(factory),
-            sitePreference(factory),
-            locationContinuity(factory),   // S3: Bonus même localisation AM/PM
-            siteChangePenalty(factory),    // S4: Pénalité changement de site
+            // MEDIUM/SOFT - Flexible staff constraints (using groupBy)
+            flexibleCorrectDaysOff(factory),   // M-FLEX-1: Flexible max work days
+            flexibleWorkDayReward(factory),    // S-FLEX-2: Encourage flexible assignment
+
+            // MEDIUM - ShiftSlot coverage (simple negative penalties)
+            unassignedSurgicalPenalty(factory),     // M-UNASSIGNED-SURGICAL
+            unassignedConsultationPenalty(factory), // M-UNASSIGNED-CONSULTATION
+
+            // SOFT - ShiftSlot preferences
+            slotPhysicianPreference(factory),  // SS1: Bonus for preferred physician
+            slotSkillPreference(factory),      // SS2: Bonus for preferred skill
+            slotLocationContinuity(factory),   // SS3: Bonus for same location AM/PM
+
+            // =====================================================================
+            // CLOSING CONSTRAINTS (ClosingAssignment entity)
+            // =====================================================================
+
+            closingStaffMustWorkAtLocation(factory), // H-CLOSING-WORK: Staff must work at location
+            closing1rDifferentFrom2f(factory),       // H-CLOSING: 1R ≠ 2F (HARD)
+            unassignedClosingPenalty(factory),       // M-CLOSING-UNASSIGNED: Penalty for unassigned
+
+            // SOFT - workload fairness
+            slotSiteChangePenalty(factory),      // SS4: Pénalité changement de site
+            workloadFairness(factory),           // S-WORKLOAD: Closing + Porrentruy combinés
         };
     }
 
     // =========================================================================
-    // HARD CONSTRAINTS
+    // SHIFT SLOT CONSTRAINTS - HARD (NEW MODEL)
     // =========================================================================
 
+    // NOTE: HS1 (skill eligibility), HS2 (site eligibility), HS3 (staff availability)
+    // ont été SUPPRIMÉS car filtrés en amont via ShiftSlotChangeMoveFilter.
+    // Le filtre rejette les moves invalides AVANT que le solver les considère,
+    // réduisant ainsi l'espace de recherche et accélérant le solving.
+
     /**
-     * H11: Staff NON-flexible ne peut pas avoir un shift REST.
-     * Seuls les staff flexibles peuvent avoir des jours de repos.
+     * HS4: Staff can't be assigned to two slots at the same time (same date/period).
+     * This prevents double-booking.
      */
-    Constraint nonFlexibleMustWork(ConstraintFactory factory) {
-        return factory.forEach(StaffAssignment.class)
-            .filter(a -> !a.getStaff().isHasFlexibleSchedule())
-            .filter(a -> a.getShift().isRest())
-            .penalize(HardMediumSoftScore.ofHard(100000))  // TRÈS forte pénalité
-            .asConstraint("H11: Non-flexible must work");
+    Constraint slotNoDoubleBooking(ConstraintFactory factory) {
+        return factory.forEachIncludingUnassigned(ShiftSlot.class)
+            .filter(slot -> slot.getStaff() != null)
+            .join(ShiftSlot.class,
+                Joiners.equal(slot -> slot.getStaff().getId(), slot -> slot.getStaff().getId()),
+                Joiners.equal(ShiftSlot::getDate, ShiftSlot::getDate),
+                Joiners.equal(ShiftSlot::getPeriodId, ShiftSlot::getPeriodId),
+                Joiners.lessThan(ShiftSlot::getId, ShiftSlot::getId))  // Avoid counting twice
+            .penalize(HardMediumSoftScore.ofHard(100))
+            .asConstraint("HS4: Slot no double booking");
     }
 
     /**
-     * H12: Staff flexible ne peut pas avoir de jours mixtes.
-     * Si AM est REST, alors PM doit aussi être REST (et vice versa).
-     * Évalué pour chaque assignment individuellement.
+     * M-FLEX-1: Flexible staff - ne doit pas dépasser daysPerWeek jours travaillés.
+     *
+     * Un jour travaillé = au moins 1 slot assigné (AM ou PM ou les deux).
+     * Utilise groupBy avec toSet pour collecter les dates uniques par staff.
+     *
+     * Ex: daysPerWeek=3 → peut travailler max 3 jours (seulement AM ou AM+PM OK)
      */
-    Constraint flexibleMixedDays(ConstraintFactory factory) {
-        return factory.forEach(StaffAssignment.class)
-            .filter(a -> a.getStaff().isHasFlexibleSchedule())
-            .filter(a -> a.getOtherHalfDay() != null)
-            .filter(a -> a.getOtherHalfDay().getShift() != null)  // L'autre demi-journée doit être assignée
-            .filter(a -> a.getShift().isRest() != a.getOtherHalfDay().getShift().isRest())  // XOR = mixte
-            .penalize(HardMediumSoftScore.ofHard(50000))  // TRÈS forte pénalité par demi-journée mixte
-            .asConstraint("H12: Flexible no mixed days");
-    }
-
-    /**
-     * H13: Staff flexible doit avoir suffisamment de slots REST.
-     * Évalué pour chaque slot individuellement (pas besoin d'attendre AM+PM).
-     * Staff 80% (4j/5j) = 2 REST slots (1 jour), Staff 60% (3j/5j) = 4 REST slots (2 jours)
-     */
-    Constraint flexibleMinRestSlots(ConstraintFactory factory) {
-        return factory.forEach(StaffAssignment.class)
-            .filter(a -> a.getStaff().isHasFlexibleSchedule())
-            .filter(a -> a.getStaff().getDaysPerWeek() != null)
-            .groupBy(StaffAssignment::getStaff,
-                // Compte les slots REST
-                ConstraintCollectors.sum((StaffAssignment a) -> a.getShift().isRest() ? 1 : 0),
-                // Compte le total de slots
-                ConstraintCollectors.count())
-            .filter((staff, restSlots, totalSlots) -> {
-                // Staff needs (5 - daysPerWeek) REST days = 2 × (5 - daysPerWeek) REST slots
-                int daysPerWeek = staff.getDaysPerWeek();
-                int restDaysNeeded = 5 - daysPerWeek; // 80%=1 jour, 60%=2 jours
-                int restSlotsNeeded = restDaysNeeded * 2; // AM + PM
-                return restSlots < restSlotsNeeded;
+    Constraint flexibleCorrectDaysOff(ConstraintFactory factory) {
+        return factory.forEach(ShiftSlot.class)
+            .filter(slot -> slot.getStaff() != null)
+            .filter(slot -> slot.getStaff().isHasFlexibleSchedule())
+            .filter(slot -> !slot.isAdmin() && !slot.isRest())
+            // Grouper par staff, collecter les dates uniques
+            .groupBy(ShiftSlot::getStaff,
+                     ConstraintCollectors.toSet(ShiftSlot::getDate))
+            // Vérifier si jours travaillés > daysPerWeek
+            .filter((staff, dates) -> {
+                Integer daysPerWeek = staff.getDaysPerWeek();
+                return daysPerWeek != null && dates.size() > daysPerWeek;
             })
-            .penalize(HardMediumSoftScore.ofHard(5000), // Pénalité progressive
-                (staff, restSlots, totalSlots) -> {
-                    int daysPerWeek = staff.getDaysPerWeek();
-                    int restSlotsNeeded = (5 - daysPerWeek) * 2;
-                    return restSlotsNeeded - restSlots;
+            // Pénalité proportionnelle au dépassement
+            .penalize(HardMediumSoftScore.ofMedium(5000),
+                      (staff, dates) -> dates.size() - staff.getDaysPerWeek())
+            .asConstraint("M-FLEX-1: Flexible max work days");
+    }
+
+    /**
+     * S-FLEX-2: Reward pour chaque jour travaillé par un flexible.
+     * Encourage le solver à assigner les flexibles (jusqu'à daysPerWeek).
+     * Un reward par jour travaillé (pas par slot).
+     */
+    Constraint flexibleWorkDayReward(ConstraintFactory factory) {
+        return factory.forEach(ShiftSlot.class)
+            .filter(slot -> slot.getStaff() != null)
+            .filter(slot -> slot.getStaff().isHasFlexibleSchedule())
+            .filter(slot -> !slot.isAdmin() && !slot.isRest())
+            // Grouper par staff, collecter les dates uniques
+            .groupBy(ShiftSlot::getStaff,
+                     ConstraintCollectors.toSet(ShiftSlot::getDate))
+            // Reward pour chaque jour travaillé (taille du set)
+            .reward(HardMediumSoftScore.ofSoft(2000),
+                    (staff, dates) -> dates.size())
+            .asConstraint("S-FLEX-2: Flexible work day reward");
+    }
+
+    // =========================================================================
+    // SHIFT SLOT CONSTRAINTS - MEDIUM (Coverage - simple negative penalties)
+    // =========================================================================
+
+    /**
+     * M-UNASSIGNED-SURGICAL: Pénalité pour chaque slot chirurgical non couvert.
+     */
+    Constraint unassignedSurgicalPenalty(ConstraintFactory factory) {
+        return factory.forEachIncludingUnassigned(ShiftSlot.class)
+            .filter(slot -> slot.getStaff() == null)
+            .filter(ShiftSlot::isSurgical)
+            .penalize(HardMediumSoftScore.ofMedium(1500))
+            .asConstraint("M-UNASSIGNED-SURGICAL: Uncovered surgical slot");
+    }
+
+    /**
+     * M-UNASSIGNED-CONSULTATION: Pénalité pour chaque slot consultation non couvert.
+     */
+    Constraint unassignedConsultationPenalty(ConstraintFactory factory) {
+        return factory.forEachIncludingUnassigned(ShiftSlot.class)
+            .filter(slot -> slot.getStaff() == null)
+            .filter(ShiftSlot::isConsultation)
+            .penalize(HardMediumSoftScore.ofMedium(1000))
+            .asConstraint("M-UNASSIGNED-CONSULTATION: Uncovered consultation slot");
+    }
+
+    // NOTE: unassignedClosingPenalty removed - closing is now via closingRole variable
+    // Missing closing roles are penalized via exactly1RPerLocationDate/exactly2FPerLocationDate
+
+    // =========================================================================
+    // SHIFT SLOT CONSTRAINTS - SOFT (Preferences)
+    // =========================================================================
+
+    /**
+     * SS1: Bonus if staff works with a preferred physician.
+     */
+    Constraint slotPhysicianPreference(ConstraintFactory factory) {
+        return factory.forEachIncludingUnassigned(ShiftSlot.class)
+            .filter(slot -> slot.getStaff() != null)
+            .filter(slot -> slot.getShift() != null)
+            .filter(slot -> slot.getShift().getPhysicianIds() != null && !slot.getShift().getPhysicianIds().isEmpty())
+            .reward(HardMediumSoftScore.ofSoft(1),
+                slot -> {
+                    Set<UUID> shiftPhysicians = slot.getShift().getPhysicianIds();
+                    int bestPriority = 0;
+                    for (UUID physicianId : shiftPhysicians) {
+                        int priority = slot.getStaff().getPhysicianPriority(physicianId);
+                        if (priority > 0 && (bestPriority == 0 || priority < bestPriority)) {
+                            bestPriority = priority;
+                        }
+                    }
+                    // P1=100, P2=60, P3=30
+                    if (bestPriority == 1) return 100;
+                    if (bestPriority == 2) return 60;
+                    if (bestPriority == 3) return 30;
+                    return 0;
                 })
-            .asConstraint("H13: Flexible min REST slots");
+            .asConstraint("SS1: Slot physician preference");
     }
 
     /**
-     * H6: Staff flexible doit travailler exactement daysPerWeek jours.
-     *
-     * Un jour de TRAVAIL = AM !REST ET PM !REST
-     * Un jour REST = AM REST ET PM REST
-     * (Les jours mixtes sont gérés par H12)
-     *
-     * Note: Pendant la construction heuristic, getOtherHalfDay().getShift() peut être null
+     * SS2: Bonus if staff works with a preferred skill.
      */
-    Constraint flexibleExactDays(ConstraintFactory factory) {
-        return factory.forEach(StaffAssignment.class)
-            .filter(a -> a.getStaff().isHasFlexibleSchedule())
-            .filter(a -> a.getStaff().getDaysPerWeek() != null)
-            .filter(a -> a.getPeriodId() == 1)  // AM seulement pour éviter double comptage
-            .filter(a -> a.getOtherHalfDay() != null)
-            .filter(a -> a.getOtherHalfDay().getShift() != null)  // Attendre que PM soit assigné
-            .groupBy(StaffAssignment::getStaff,
-                // Compte les jours de travail complets (AM !REST ET PM !REST)
-                ConstraintCollectors.sum((StaffAssignment am) -> {
-                    boolean amWork = !am.getShift().isRest();
-                    boolean pmWork = !am.getOtherHalfDay().getShift().isRest();
-                    return (amWork && pmWork) ? 1 : 0;
-                }))
-            .filter((staff, workDays) -> workDays != staff.getDaysPerWeek())
-            .penalize(HardMediumSoftScore.ofHard(10000),  // TRÈS forte pénalité
-                (staff, workDays) -> Math.abs(staff.getDaysPerWeek() - workDays))
-            .asConstraint("H6: Flexible exact days");
-    }
-
-    /**
-     * H1: Staff doit avoir la compétence requise pour le shift.
-     * Exclut REST et Admin qui n'ont pas d'exigence de compétence.
-     */
-    Constraint skillEligibility(ConstraintFactory factory) {
-        return factory.forEach(StaffAssignment.class)
-            .filter(a -> !a.getShift().isRest())
-            .filter(a -> !a.getShift().isAdmin())
-            .filter(a -> !a.getStaff().hasSkill(a.getShift().getSkillId()))
-            .penalize(HardMediumSoftScore.ofHard(1))
-            .asConstraint("H1: Skill eligibility");
-    }
-
-    /**
-     * H2: Staff doit pouvoir travailler sur le site du shift.
-     * Exclut REST et Admin qui n'ont pas de restriction de site.
-     */
-    Constraint siteEligibility(ConstraintFactory factory) {
-        return factory.forEach(StaffAssignment.class)
-            .filter(a -> !a.getShift().isRest())
-            .filter(a -> !a.getShift().isAdmin())
-            .filter(a -> a.getShift().getSiteId() != null)
-            .filter(a -> !a.getStaff().canWorkAtSite(a.getShift().getSiteId()))
-            .penalize(HardMediumSoftScore.ofHard(1))
-            .asConstraint("H2: Site eligibility");
-    }
-
-    /**
-     * H9b: Pas plus de staff que quantityNeeded par shift.
-     * Admin et REST ont quantity=999 donc illimité (exclus du check).
-     */
-    Constraint shiftCapacity(ConstraintFactory factory) {
-        return factory.forEach(StaffAssignment.class)
-            .filter(a -> !a.getShift().isRest())
-            .filter(a -> !a.getShift().isAdmin())
-            .groupBy(StaffAssignment::getShift, ConstraintCollectors.count())
-            .filter((shift, count) -> count > shift.getQuantityNeeded())
-            .penalize(HardMediumSoftScore.ofHard(1),
-                (shift, count) -> count - shift.getQuantityNeeded())
-            .asConstraint("H9b: Shift capacity");
-    }
-
-    // =========================================================================
-    // MEDIUM CONSTRAINTS (couverture - bonus pour shifts couverts)
-    // =========================================================================
-
-    /**
-     * M1: Bonus pour les shifts surgical couverts.
-     * Score = base(200) × skillMultiplier + physicianBonus
-     *
-     * Surgical P4 (200) > Consultation P1 (160) → garantit que surgical est prioritaire
-     */
-    Constraint coveredSurgical(ConstraintFactory factory) {
-        return factory.forEach(StaffAssignment.class)
-            .filter(a -> !a.getShift().isRest())
-            .filter(a -> !a.getShift().isAdmin())
-            .filter(a -> "surgical".equals(a.getShift().getNeedType()))
-            .reward(HardMediumSoftScore.ofMedium(1),
-                a -> calculateMediumScore(a, 200))
-            .asConstraint("M1: Covered surgical");
-    }
-
-    /**
-     * M2: Bonus pour les shifts consultation couverts.
-     * Score = base(40) × skillMultiplier + physicianBonus
-     */
-    Constraint coveredConsultation(ConstraintFactory factory) {
-        return factory.forEach(StaffAssignment.class)
-            .filter(a -> !a.getShift().isRest())
-            .filter(a -> !a.getShift().isAdmin())
-            .filter(a -> "consultation".equals(a.getShift().getNeedType()))
-            .reward(HardMediumSoftScore.ofMedium(1),
-                a -> calculateMediumScore(a, 40))
-            .asConstraint("M2: Covered consultation");
-    }
-
-    /**
-     * Calcule le score MEDIUM pour une assignation.
-     *
-     * @param a L'assignation
-     * @param base Score de base (200 pour surgical, 40 pour consultation)
-     * @return Score total = base × skillMultiplier + physicianBonus
-     *
-     * Skill preference multiplier:
-     * - P1 (meilleure) = ×4
-     * - P2 = ×3
-     * - P3 = ×2
-     * - P4 = ×1
-     * - Pas de préférence = ×0.5
-     *
-     * Physician preference bonus (si médecin préféré présent):
-     * - P1 = +50
-     * - P2 = +30
-     * - P3 = +15
-     */
-    private int calculateMediumScore(StaffAssignment a, int base) {
-        // 1. Skill preference multiplier
-        int skillPref = a.getSkillPreference(); // 1-4, 0 if none
-        double skillMultiplier;
-        if (skillPref == 0) {
-            skillMultiplier = 0.5;
-        } else {
-            skillMultiplier = 5 - skillPref; // P1=4, P2=3, P3=2, P4=1
-        }
-
-        // 2. Physician preference bonus
-        int physicianBonus = 0;
-        Set<UUID> shiftPhysicians = a.getShift().getPhysicianIds();
-        if (shiftPhysicians != null && !shiftPhysicians.isEmpty()) {
-            int bestPriority = 0;
-            for (UUID physicianId : shiftPhysicians) {
-                int priority = a.getStaff().getPhysicianPriority(physicianId);
-                if (priority > 0 && (bestPriority == 0 || priority < bestPriority)) {
-                    bestPriority = priority;
-                }
-            }
-            // P1=50, P2=30, P3=15
-            if (bestPriority == 1) physicianBonus = 50;
-            else if (bestPriority == 2) physicianBonus = 30;
-            else if (bestPriority == 3) physicianBonus = 15;
-        }
-
-        return (int)(base * skillMultiplier) + physicianBonus;
-    }
-
-    // =========================================================================
-    // SOFT CONSTRAINTS (préférences)
-    // =========================================================================
-
-    /**
-     * S1: Bonus si staff a une bonne préférence pour la compétence.
-     * Exclut REST et Admin.
-     */
-    Constraint skillPreference(ConstraintFactory factory) {
-        return factory.forEach(StaffAssignment.class)
-            .filter(a -> !a.getShift().isRest())
-            .filter(a -> !a.getShift().isAdmin())
-            .filter(a -> a.getSkillPreference() > 0)
+    Constraint slotSkillPreference(ConstraintFactory factory) {
+        return factory.forEachIncludingUnassigned(ShiftSlot.class)
+            .filter(slot -> slot.getStaff() != null)
             .reward(HardMediumSoftScore.ofSoft(1),
-                a -> 5 - a.getSkillPreference())  // P1=4, P2=3, P3=2, P4=1
-            .asConstraint("S1: Skill preference");
+                slot -> {
+                    int skillPref = slot.getSkillPreference(); // 1-4, 0 if none
+                    // P1=80, P2=60, P3=40, P4=20, none=0
+                    if (skillPref == 1) return 80;
+                    if (skillPref == 2) return 60;
+                    if (skillPref == 3) return 40;
+                    if (skillPref == 4) return 20;
+                    return 0;
+                })
+            .asConstraint("SS2: Slot skill preference");
     }
 
     /**
-     * S2: Bonus si staff travaille à son site préféré.
-     * Exclut REST et Admin.
+     * SS3: Bonus if staff stays at the same location between AM and PM.
+     * Encourages continuity to avoid travel between locations.
      */
-    Constraint sitePreference(ConstraintFactory factory) {
-        return factory.forEach(StaffAssignment.class)
-            .filter(a -> !a.getShift().isRest())
-            .filter(a -> !a.getShift().isAdmin())
-            .filter(a -> a.getShift().getSiteId() != null)
-            .filter(a -> a.getStaff().getSitePriority(a.getShift().getSiteId()) > 0)
-            .reward(HardMediumSoftScore.ofSoft(1),
-                a -> 4 - a.getStaff().getSitePriority(a.getShift().getSiteId()))  // P1=3, P2=2, P3=1
-            .asConstraint("S2: Site preference");
+    Constraint slotLocationContinuity(ConstraintFactory factory) {
+        return factory.forEachIncludingUnassigned(ShiftSlot.class)
+            .filter(slot -> slot.getStaff() != null)
+            .filter(slot -> slot.getPeriodId() == 1)  // AM only to avoid double counting
+            .filter(slot -> slot.getLocationId() != null)
+            .join(ShiftSlot.class,
+                Joiners.equal(slot -> slot.getStaff().getId(), slot -> slot.getStaff().getId()),
+                Joiners.equal(ShiftSlot::getDate, ShiftSlot::getDate),
+                Joiners.filtering((am, pm) -> pm.getPeriodId() == 2))
+            .filter((am, pm) -> pm.getStaff() != null)
+            .filter((am, pm) -> pm.getLocationId() != null)
+            .filter((am, pm) -> am.getLocationId().equals(pm.getLocationId()))
+            .reward(HardMediumSoftScore.ofSoft(50))  // Bonus for same location
+            .asConstraint("SS3: Slot location continuity");
+    }
+
+    // =========================================================================
+    // CLOSING CONSTRAINTS (ClosingAssignment entity)
+    // =========================================================================
+
+    /**
+     * H-CLOSING-WORK: Staff assigned to a ClosingAssignment must work at that location on that date.
+     * This ensures the person with closing responsibility is actually present.
+     */
+    Constraint closingStaffMustWorkAtLocation(ConstraintFactory factory) {
+        return factory.forEach(ClosingAssignment.class)
+            .filter(ca -> ca.getStaff() != null)
+            .ifNotExists(ShiftSlot.class,
+                Joiners.equal(ca -> ca.getStaff().getId(), slot -> slot.getStaff() != null ? slot.getStaff().getId() : null),
+                Joiners.equal(ClosingAssignment::getLocationId, ShiftSlot::getLocationId),
+                Joiners.equal(ClosingAssignment::getDate, ShiftSlot::getDate))
+            .penalize(HardMediumSoftScore.ofHard(10000))
+            .asConstraint("H-CLOSING-WORK: Staff must work at location");
     }
 
     /**
-     * S3: Bonus si staff reste à la même localisation entre AM et PM.
-     * Encourage la continuité pour éviter les déplacements.
+     * H-CLOSING: 1R et 2F doivent être des personnes différentes (même location/date).
+     * Uses ClosingAssignment entity.
      */
-    Constraint locationContinuity(ConstraintFactory factory) {
-        return factory.forEach(StaffAssignment.class)
-            .filter(a -> a.getPeriodId() == 1)  // AM seulement pour éviter double comptage
-            .filter(a -> !a.getShift().isRest())
-            .filter(a -> !a.getShift().isAdmin())
-            .filter(a -> a.getOtherHalfDay() != null)
-            .filter(a -> a.getOtherHalfDay().getShift() != null)
-            .filter(a -> !a.getOtherHalfDay().getShift().isRest())
-            .filter(a -> !a.getOtherHalfDay().getShift().isAdmin())
-            .filter(a -> a.getShift().getLocationId() != null)
-            .filter(a -> a.getOtherHalfDay().getShift().getLocationId() != null)
-            .filter(a -> a.getShift().getLocationId().equals(
-                         a.getOtherHalfDay().getShift().getLocationId()))
-            .reward(HardMediumSoftScore.ofSoft(10))  // Bonus pour même localisation
-            .asConstraint("S3: Location continuity");
+    Constraint closing1rDifferentFrom2f(ConstraintFactory factory) {
+        return factory.forEach(ClosingAssignment.class)
+            .filter(ca -> ca.getStaff() != null)
+            .filter(ca -> ca.getRole() == ClosingRole.ROLE_1R)
+            .join(ClosingAssignment.class,
+                Joiners.equal(ClosingAssignment::getLocationId),
+                Joiners.equal(ClosingAssignment::getDate),
+                Joiners.filtering((ca1, ca2) ->
+                    ca2.getRole() == ClosingRole.ROLE_2F &&
+                    ca2.getStaff() != null &&
+                    ca1.getStaff().getId().equals(ca2.getStaff().getId())))
+            .penalize(HardMediumSoftScore.ofHard(10000))
+            .asConstraint("H-CLOSING: 1R != 2F");
     }
 
     /**
-     * S4: Pénalité si staff change de site entre AM et PM.
-     * Évite les déplacements entre sites différents dans la même journée.
+     * M-CLOSING-UNASSIGNED: Penalty for each unassigned ClosingAssignment.
      */
-    Constraint siteChangePenalty(ConstraintFactory factory) {
-        return factory.forEach(StaffAssignment.class)
-            .filter(a -> a.getPeriodId() == 1)  // AM seulement pour éviter double comptage
-            .filter(a -> !a.getShift().isRest())
-            .filter(a -> !a.getShift().isAdmin())
-            .filter(a -> a.getOtherHalfDay() != null)
-            .filter(a -> a.getOtherHalfDay().getShift() != null)
-            .filter(a -> !a.getOtherHalfDay().getShift().isRest())
-            .filter(a -> !a.getOtherHalfDay().getShift().isAdmin())
-            .filter(a -> a.getShift().getSiteId() != null)
-            .filter(a -> a.getOtherHalfDay().getShift().getSiteId() != null)
-            .filter(a -> !a.getShift().getSiteId().equals(
-                         a.getOtherHalfDay().getShift().getSiteId()))
-            .penalize(HardMediumSoftScore.ofSoft(20))  // Pénalité pour changement de site
-            .asConstraint("S4: Site change penalty");
+    Constraint unassignedClosingPenalty(ConstraintFactory factory) {
+        return factory.forEach(ClosingAssignment.class)
+            .filter(ca -> ca.getStaff() == null)
+            .penalize(HardMediumSoftScore.ofMedium(2000))
+            .asConstraint("M-CLOSING-UNASSIGNED: Unassigned closing responsibility");
+    }
+
+    // =========================================================================
+    // ADDITIONAL SOFT CONSTRAINTS
+    // =========================================================================
+
+    /**
+     * SS4: Pénalité si staff change de site entre AM et PM.
+     * Uses ShiftSlot instead of StaffAssignment.
+     */
+    Constraint slotSiteChangePenalty(ConstraintFactory factory) {
+        return factory.forEachIncludingUnassigned(ShiftSlot.class)
+            .filter(slot -> slot.getStaff() != null)
+            .filter(slot -> slot.getPeriodId() == 1)  // AM only
+            .filter(slot -> slot.getSiteId() != null)
+            .join(ShiftSlot.class,
+                Joiners.equal(slot -> slot.getStaff().getId(), slot -> slot.getStaff().getId()),
+                Joiners.equal(ShiftSlot::getDate, ShiftSlot::getDate),
+                Joiners.filtering((am, pm) -> pm.getPeriodId() == 2))
+            .filter((am, pm) -> pm.getStaff() != null)
+            .filter((am, pm) -> pm.getSiteId() != null)
+            .filter((am, pm) -> !am.getSiteId().equals(pm.getSiteId()))
+            .penalize(HardMediumSoftScore.ofSoft(20))
+            .asConstraint("SS4: Slot site change penalty");
+    }
+
+    /**
+     * S-WORKLOAD: Charge de travail combinée (closing + Porrentruy).
+     *
+     * Formule: Pénalité = charge² où charge = closingCharge + porrentruyCharge
+     *
+     * Closing charge (from ClosingAssignment):
+     *   - 1R = 10 points
+     *   - 2F = 13 points (1.3× plus lourd que 1R)
+     *
+     * Porrentruy charge (si pas pref 1):
+     *   - 10 points par jour au-delà de 1 jour
+     *   - 1 jour = 0, 2 jours = 10, 3 jours = 20, etc.
+     */
+    Constraint workloadFairness(ConstraintFactory factory) {
+        // Stream 1: Closing charges per staff (10×1R + 13×2F) from ClosingAssignment
+        var closingCharges = factory.forEach(ClosingAssignment.class)
+            .filter(ca -> ca.getStaff() != null)
+            .filter(ca -> ca.getRole() != ClosingRole.ROLE_3F)
+            .groupBy(ClosingAssignment::getStaff,
+                ConstraintCollectors.sum(ca -> {
+                    ClosingRole role = ca.getRole();
+                    if (role == ClosingRole.ROLE_1R) return 10;
+                    if (role == ClosingRole.ROLE_2F) return 13;
+                    return 0;
+                }));
+
+        // Stream 2: Porrentruy charges per staff (10×(days-1) if days>1 and not pref 1)
+        var porrentruyCharges = factory.forEachIncludingUnassigned(ShiftSlot.class)
+            .filter(slot -> slot.getStaff() != null)
+            .filter(slot -> "Porrentruy".equalsIgnoreCase(slot.getSiteName()))
+            .filter(slot -> slot.getStaff().getSitePriority(slot.getSiteId()) != 1)
+            .groupBy(ShiftSlot::getStaff,
+                ConstraintCollectors.toSet(ShiftSlot::getDate))
+            .groupBy((staff, dates) -> staff,
+                ConstraintCollectors.sum((staff, dates) ->
+                    dates.size() > 1 ? (dates.size() - 1) * 10 : 0));
+
+        // Combine both streams and apply quadratic penalty (÷10 pour réduire l'agressivité)
+        return closingCharges.concat(porrentruyCharges)
+            .groupBy((staff, charge) -> staff,
+                ConstraintCollectors.sum((staff, charge) -> charge))
+            .penalize(HardMediumSoftScore.ofSoft(1),
+                (staff, totalCharge) -> (totalCharge * totalCharge) / 10)
+            .asConstraint("S-WORKLOAD: Fairness");
     }
 }

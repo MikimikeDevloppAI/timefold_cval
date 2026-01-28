@@ -70,18 +70,23 @@ public class SupabaseRepository {
         List<Shift> adminShifts = ensureAdminShifts(shifts, startDate, endDate);
         shifts.addAll(adminShifts);
 
-        // Create REST shifts for each date/period (used by flexible staff for days off)
-        List<Shift> restShifts = createRestShifts(startDate, endDate);
-        shifts.addAll(restShifts);
+        // NOTE: REST shifts removed - flexible staff will simply have fewer assignments
+        // HS6 constraint ensures they don't exceed max days, but no minimum enforced
+
+        // NOTE: Closing is now a @PlanningVariable on ShiftSlot (closingRole), not separate shifts
+        // Shifts with needs1r/needs2f/needs3f flags indicate locations requiring closing responsibilities
+        // The solver assigns closingRole to consultation slots at these locations
 
         solution.setShifts(shifts);
-        log.info("Loaded {} shifts (including {} Admin + {} REST)",
-            shifts.size(), adminShifts.size(), restShifts.size());
+        log.info("Loaded {} shifts (including {} Admin)", shifts.size(), adminShifts.size());
 
-        // Create closing assignments (separate planning entities)
+        // Create ShiftSlots from shifts (1 slot per unit of coverage)
+        List<ShiftSlot> shiftSlots = createShiftSlots(shifts);
+        solution.setShiftSlots(shiftSlots);
+
+        // Create ClosingAssignments for locations with closing needs
         List<ClosingAssignment> closingAssignments = createClosingAssignments(shifts);
         solution.setClosingAssignments(closingAssignments);
-        log.info("Created {} closing assignments (1R/2F/3F)", closingAssignments.size());
 
         // Load physician presence and link to shifts
         loadPhysicianPresence(startDate, endDate, shifts);
@@ -89,11 +94,9 @@ public class SupabaseRepository {
         // Initialize lookup maps
         solution.initializeMaps();
 
-        // Create assignments (one per available staff/date/period - INVERTED MODEL)
-        List<StaffAssignment> assignments = createAssignmentsFromStaff(
-            staffList, shifts, absences, startDate, endDate);
-        solution.setAssignments(assignments);
-        log.info("Created {} assignments from staff availability", assignments.size());
+        // NOTE: StaffAssignment model has been removed
+        // All coverage is now handled via ShiftSlot (1 slot = 1 unit of coverage)
+        // Staff flexible constraints are enforced via shadow variables on ShiftSlot
 
         return solution;
     }
@@ -440,305 +443,135 @@ public class SupabaseRepository {
     }
 
     /**
-     * Create ClosingAssignment entities for each (location, date, role) that needs closing.
-     * These are separate planning entities - the solver chooses which staff gets assigned.
-     * One ClosingAssignment covers the ENTIRE DAY (both AM and PM).
+     * Create ShiftSlots from shifts.
+     * MODEL: 1 slot = 1 unit of coverage.
+     * If a shift has quantityNeeded=3, we create 3 ShiftSlots.
+     *
+     * NOTE: Closing responsibilities are handled via ClosingAssignment entity, not here.
      */
-    private List<ClosingAssignment> createClosingAssignments(List<Shift> shifts) {
-        List<ClosingAssignment> closingAssignments = new ArrayList<>();
+    private List<ShiftSlot> createShiftSlots(List<Shift> shifts) {
+        List<ShiftSlot> slots = new ArrayList<>();
 
-        // Group shifts by (locationId, date) to find locations with closing needs
-        Map<String, List<Shift>> shiftsByLocationDate = shifts.stream()
-            .filter(s -> s.getLocationId() != null)
-            .filter(s -> s.isHasClosing())
-            .filter(s -> !s.isAdmin() && !s.isRest())
-            .collect(Collectors.groupingBy(s -> s.getLocationId() + "|" + s.getDate()));
-
-        for (Map.Entry<String, List<Shift>> entry : shiftsByLocationDate.entrySet()) {
-            List<Shift> shiftsAtLocation = entry.getValue();
-            if (shiftsAtLocation.isEmpty()) continue;
-
-            // Get a reference shift for location info
-            Shift refShift = shiftsAtLocation.get(0);
-
-            // Check which periods have staff needs (both AM and PM required for closing)
-            boolean hasMorning = shiftsAtLocation.stream().anyMatch(s -> s.getPeriodId() == 1);
-            boolean hasAfternoon = shiftsAtLocation.stream().anyMatch(s -> s.getPeriodId() == 2);
-
-            // Only create closing assignments if location is open for both periods
-            // (closing responsibility requires working the whole day at the location)
-            if (!hasMorning || !hasAfternoon) {
-                log.debug("Skipping closing for {} on {} - not open full day (AM={}, PM={})",
-                    refShift.getLocationName(), refShift.getDate(), hasMorning, hasAfternoon);
+        // Create slots for all non-admin/rest shifts
+        for (Shift shift : shifts) {
+            // Skip admin and rest (unlimited capacity, not needed as slots)
+            if (shift.isAdmin() || shift.isRest()) {
                 continue;
             }
 
-            // Calculate staff needed per period (AM/PM)
-            // Only need closing assignments if multiple staff work the same period (>1 person per period)
-            // If only 1 person works AM and 1 person works PM, no closing is needed
-            int staffNeededAM = shiftsAtLocation.stream()
-                .filter(s -> s.getPeriodId() == 1)
-                .mapToInt(Shift::getQuantityNeeded)
-                .sum();
-            int staffNeededPM = shiftsAtLocation.stream()
-                .filter(s -> s.getPeriodId() == 2)
-                .mapToInt(Shift::getQuantityNeeded)
-                .sum();
-
-            // Need closing only if there are multiple staff in at least one period
-            // (if only 1 staff per period, that person does everything - no need to assign closing roles)
-            if (staffNeededAM <= 1 && staffNeededPM <= 1) {
-                log.debug("Skipping closing for {} on {} - only {} staff AM, {} staff PM (no closing needed for single person)",
-                    refShift.getLocationName(), refShift.getDate(), staffNeededAM, staffNeededPM);
-                continue;
-            }
-
-            // Determine if we need 1R, 2F, 3F based on any shift at this location/date
-            boolean needs1r = shiftsAtLocation.stream().anyMatch(Shift::isNeeds1r);
-            boolean needs2f = shiftsAtLocation.stream().anyMatch(Shift::isNeeds2f);
-            boolean needs3f = shiftsAtLocation.stream().anyMatch(Shift::isNeeds3f);
-
-            // Create one ClosingAssignment per role needed (covers entire day)
-            if (needs1r) {
-                closingAssignments.add(new ClosingAssignment(
-                    refShift.getLocationId(),
-                    refShift.getLocationName(),
-                    refShift.getDate(),
-                    ClosingRole.ROLE_1R
-                ));
-            }
-            if (needs2f) {
-                closingAssignments.add(new ClosingAssignment(
-                    refShift.getLocationId(),
-                    refShift.getLocationName(),
-                    refShift.getDate(),
-                    ClosingRole.ROLE_2F
-                ));
-            }
-            if (needs3f) {
-                closingAssignments.add(new ClosingAssignment(
-                    refShift.getLocationId(),
-                    refShift.getLocationName(),
-                    refShift.getDate(),
-                    ClosingRole.ROLE_3F
-                ));
+            for (int i = 0; i < shift.getQuantityNeeded(); i++) {
+                slots.add(new ShiftSlot(shift, i));
             }
         }
 
-        log.info("Created {} closing assignments (1R/2F/3F) from {} locations with closing needs",
-            closingAssignments.size(), shiftsByLocationDate.size());
+        // Log statistics
+        long surgicalSlots = slots.stream().filter(ShiftSlot::isSurgical).count();
+        long consultationSlots = slots.stream().filter(ShiftSlot::isConsultation).count();
+        long closingEligible = slots.stream().filter(ShiftSlot::isEligibleForClosing).count();
 
-        return closingAssignments;
+        log.info("Created {} ShiftSlots ({} surgical, {} consultation, {} eligible for closing)",
+            slots.size(), surgicalSlots, consultationSlots, closingEligible);
+
+        return slots;
     }
 
     /**
-     * Create assignment slots based on STAFF AVAILABILITY (INVERTED MODEL).
-     * One assignment is created for each (staff, date, period) where staff is available.
-     * The solver will then assign each staff to a shift.
+     * Create ClosingAssignments based on shifts with closing needs.
+     * For each location/date with needs_1r or needs_2f, create a ClosingAssignment.
      */
-    private List<StaffAssignment> createAssignmentsFromStaff(
-            List<Staff> staffList,
-            List<Shift> shifts,
-            List<Absence> absences,
-            LocalDate startDate,
-            LocalDate endDate) {
+    private List<ClosingAssignment> createClosingAssignments(List<Shift> shifts) {
+        List<ClosingAssignment> assignments = new ArrayList<>();
 
-        // Build absence lookup map: userId -> set of (date, period) pairs
-        Map<UUID, Set<String>> absenceMap = new HashMap<>();
-        for (Absence absence : absences) {
-            absenceMap.computeIfAbsent(absence.getUserId(), k -> new HashSet<>());
-            if (absence.getPeriodId() != null) {
-                // Specific period absence
-                absenceMap.get(absence.getUserId()).add(absence.getDate() + "|" + absence.getPeriodId());
-            } else {
-                // Full day absence (both periods)
-                absenceMap.get(absence.getUserId()).add(absence.getDate() + "|1");
-                absenceMap.get(absence.getUserId()).add(absence.getDate() + "|2");
+        // Group shifts by location/date to find closing needs
+        Map<String, List<Shift>> byLocationDate = shifts.stream()
+            .filter(s -> !s.isAdmin() && !s.isRest())
+            .filter(s -> s.getLocationId() != null)
+            .collect(Collectors.groupingBy(s -> s.getLocationId() + "|" + s.getDate()));
+
+        for (var entry : byLocationDate.entrySet()) {
+            List<Shift> shiftsAtLoc = entry.getValue();
+
+            // Check if any shift at this location/date needs closing
+            boolean needs1r = shiftsAtLoc.stream().anyMatch(Shift::isNeeds1r);
+            boolean needs2f = shiftsAtLoc.stream().anyMatch(Shift::isNeeds2f);
+
+            if (!needs1r && !needs2f) {
+                continue;
+            }
+
+            // Get location info from first shift
+            Shift firstShift = shiftsAtLoc.get(0);
+            UUID locationId = firstShift.getLocationId();
+            String locationName = firstShift.getLocationName();
+            LocalDate date = firstShift.getDate();
+
+            // Create ClosingAssignment for 1R if needed
+            if (needs1r) {
+                ClosingAssignment ca = new ClosingAssignment(locationId, locationName, date, ClosingRole.ROLE_1R);
+                assignments.add(ca);
+            }
+
+            // Create ClosingAssignment for 2F if needed
+            if (needs2f) {
+                ClosingAssignment ca = new ClosingAssignment(locationId, locationName, date, ClosingRole.ROLE_2F);
+                assignments.add(ca);
             }
         }
 
-        List<StaffAssignment> assignments = new ArrayList<>();
-
-        // For each staff member
-        for (Staff staff : staffList) {
-            // For each date in the range
-            for (LocalDate date = startDate; !date.isAfter(endDate); date = date.plusDays(1)) {
-                int dayOfWeek = date.getDayOfWeek().getValue(); // 1=Monday, 7=Sunday
-
-                // For each period
-                for (int periodId = 1; periodId <= 2; periodId++) {
-                    // Check if staff is available this day/period
-                    if (!staff.isAvailable(dayOfWeek, periodId)) {
-                        continue; // Skip - staff not available
-                    }
-
-                    // Check if staff has an absence
-                    String absenceKey = date + "|" + periodId;
-                    Set<String> staffAbsences = absenceMap.get(staff.getUserId());
-                    if (staffAbsences != null && staffAbsences.contains(absenceKey)) {
-                        continue; // Skip - staff is absent
-                    }
-
-                    // Create an assignment for this staff/date/period
-                    StaffAssignment assignment = new StaffAssignment(staff, date, periodId);
-
-                    // Pre-filter valid shifts for this assignment
-                    // - Admin: always valid (fallback)
-                    // - REST: only valid for flexible staff (for their days off)
-                    // - Consultation/Surgical: valid if staff has skill AND can work at site
-                    final LocalDate assignmentDate = date;
-                    final int assignmentPeriod = periodId;
-                    final boolean isFlexible = staff.isHasFlexibleSchedule();
-                    List<Shift> validShifts = shifts.stream()
-                        .filter(s -> s.getDate().equals(assignmentDate) &&
-                            s.getPeriodId() == assignmentPeriod)
-                        .filter(s -> {
-                            // REST is only valid for flexible staff
-                            if (s.isRest()) {
-                                return isFlexible;
-                            }
-                            // Admin is always valid (fallback universel)
-                            if (s.isAdmin()) return true;
-                            // For consultation/surgical: require ELIGIBILITY (hasSkill + canWorkAtSite)
-                            // Preferences affect SOFT score, not which shifts are valid
-                            if (s.getSkillId() != null && !staff.hasSkill(s.getSkillId())) {
-                                return false; // Doesn't have the skill
-                            }
-                            UUID siteId = s.getSiteId();
-                            if (siteId != null && !staff.canWorkAtSite(siteId)) {
-                                return false; // Can't work at this site
-                            }
-                            return true;
-                        })
-                        .toList();
-                    assignment.setValidShifts(validShifts);
-
-                    assignments.add(assignment);
-                }
-            }
-        }
-
-        // Log statistics about valid shifts
-        int totalValidShifts = assignments.stream().mapToInt(a -> a.getValidShifts().size()).sum();
-        double avgValidShifts = assignments.isEmpty() ? 0 : (double) totalValidShifts / assignments.size();
-        log.info("Created {} assignments from {} staff members for {} to {} (avg {} valid shifts per assignment)",
-            assignments.size(), staffList.size(), startDate, endDate, String.format("%.1f", avgValidShifts));
-
-        // Log flexible staff summary (REST is now shift=null, not a separate shift)
-        long flexibleCount = staffList.stream().filter(Staff::isHasFlexibleSchedule).count();
-        log.info("Flexible staff: {} (will use shift=null for REST days)", flexibleCount);
-
-        // DEBUG: Log flexible staff validShifts count
-        for (Staff flexStaff : staffList.stream().filter(Staff::isHasFlexibleSchedule).toList()) {
-            List<StaffAssignment> staffAssignments = assignments.stream()
-                .filter(a -> a.getStaff().getId().equals(flexStaff.getId()))
-                .toList();
-            int flexTotalValid = staffAssignments.stream()
-                .mapToInt(a -> a.getValidShifts() != null ? a.getValidShifts().size() : 0)
-                .sum();
-            int flexAvgValid = staffAssignments.isEmpty() ? 0 : flexTotalValid / staffAssignments.size();
-            log.info("  {} ({}%): {} skills, {} sites, {} slots, avg {} valid shifts/slot",
-                flexStaff.getFullName(),
-                flexStaff.isHasFlexibleSchedule() ? (flexStaff.getDaysPerWeek() * 20) : 100,
-                flexStaff.getSkills().size(),
-                flexStaff.getSites().size(),
-                staffAssignments.size(),
-                flexAvgValid);
-        }
-
-        // Link AM↔PM assignments for O(1) constraint checks
-        Map<String, StaffAssignment> assignmentMap = new HashMap<>();
-        for (StaffAssignment a : assignments) {
-            String key = a.getStaff().getId() + "|" + a.getDate() + "|" + a.getPeriodId();
-            assignmentMap.put(key, a);
-        }
-        for (StaffAssignment a : assignments) {
-            int otherPeriod = (a.getPeriodId() == 1) ? 2 : 1;
-            String otherKey = a.getStaff().getId() + "|" + a.getDate() + "|" + otherPeriod;
-            StaffAssignment other = assignmentMap.get(otherKey);
-            a.setOtherHalfDay(other);
-        }
-        log.debug("Linked {} AM↔PM assignment pairs",
-            assignments.stream().filter(a -> a.getOtherHalfDay() != null).count() / 2);
+        log.info("Created {} ClosingAssignments (1R: {}, 2F: {})",
+            assignments.size(),
+            assignments.stream().filter(a -> a.getRole() == ClosingRole.ROLE_1R).count(),
+            assignments.stream().filter(a -> a.getRole() == ClosingRole.ROLE_2F).count());
 
         return assignments;
     }
 
+    // NOTE: createClosingShifts() method removed - closing is now a @PlanningVariable on ShiftSlot
+
     /**
-     * Save assignments to Supabase.
-     * In the INVERTED MODEL, every assignment has a staff (fixed) and a shift (assigned by solver).
-     * We skip admin assignments when saving to database (admin doesn't need to be stored).
-     *
-     * Closing responsibilities come from ClosingAssignment entities (separate planning entities).
-     * We look up the staff assigned to each closing role and set flags on their regular assignments.
+     * Save ShiftSlot assignments to Supabase.
+     * NOTE: Closing flags are saved via saveClosingAssignments() separately.
      */
-    public void saveAssignments(List<StaffAssignment> assignments, List<ClosingAssignment> closingAssignments, UUID solverRunId) throws Exception {
-        log.info("Saving {} assignments to Supabase", assignments.size());
+    public void saveAssignments(List<ShiftSlot> slots, List<ClosingAssignment> closingAssignments, UUID solverRunId) throws Exception {
+        log.info("Saving {} ShiftSlot assignments to Supabase", slots.size());
 
-        // Step 1: Build a map of closing roles from ClosingAssignment entities
-        // Key format: staffId|locationId|date -> Set of ClosingRole
-        Map<String, Set<ClosingRole>> closingRolesMap = new HashMap<>();
+        // Build a map of staff -> (locationId, date) -> closing role for lookup
+        Map<String, ClosingRole> staffClosingMap = new HashMap<>();
         for (ClosingAssignment ca : closingAssignments) {
-            if (ca.getStaff() == null) continue;
-
-            UUID staffId = ca.getStaff().getId();
-            UUID locationId = ca.getLocationId();
-            LocalDate date = ca.getDate();
-            ClosingRole role = ca.getRole();
-
-            if (locationId != null && role != null) {
-                String key = staffId + "|" + locationId + "|" + date;
-                closingRolesMap.computeIfAbsent(key, k -> new HashSet<>()).add(role);
+            if (ca.getStaff() != null) {
+                String key = ca.getStaff().getId() + "|" + ca.getLocationId() + "|" + ca.getDate();
+                // If same staff has both 1R and 2F, keep one (shouldn't happen per constraint)
+                staffClosingMap.put(key, ca.getRole());
             }
         }
-        log.info("Found {} staff/location/date combinations with closing roles", closingRolesMap.size());
 
-        // Step 2: Create records for regular assignments, applying closing flags
         List<Map<String, Object>> records = new ArrayList<>();
-        for (StaffAssignment a : assignments) {
-            // Skip if no shift assigned (shouldn't happen with nullable=false)
-            if (a.getShift() == null) {
-                continue;
-            }
-
-            // Skip admin assignments (we don't store "doing admin" in the database)
-            if (a.getShift().isAdmin()) {
-                continue;
-            }
-
-            // Skip REST shifts (days off for flexible staff, not stored)
-            if (a.getShift().isRest()) {
+        for (ShiftSlot slot : slots) {
+            // Skip unassigned slots
+            if (slot.getStaff() == null) {
                 continue;
             }
 
             Map<String, Object> record = new HashMap<>();
-            record.put("staff_id", a.getStaff().getId().toString());
+            record.put("staff_id", slot.getStaff().getId().toString());
 
-            // Location may be null for admin (but we skip admin above)
-            if (a.getLocationId() != null) {
-                record.put("location_id", a.getLocationId().toString());
+            if (slot.getLocationId() != null) {
+                record.put("location_id", slot.getLocationId().toString());
             }
 
-            record.put("date", a.getDate().toString());
-            record.put("period_id", a.getPeriodId());
+            record.put("date", slot.getDate().toString());
+            record.put("period_id", slot.getPeriodId());
 
-            if (a.getSkillId() != null) {
-                record.put("skill_id", a.getSkillId().toString());
+            if (slot.getSkillId() != null) {
+                record.put("skill_id", slot.getSkillId().toString());
             }
 
-            // Look up closing roles for this staff/location/date
-            UUID locationId = a.getLocationId();
-            if (locationId != null) {
-                String key = a.getStaff().getId() + "|" + locationId + "|" + a.getDate();
-                Set<ClosingRole> roles = closingRolesMap.get(key);
-                record.put("is_closing_1r", roles != null && roles.contains(ClosingRole.ROLE_1R));
-                record.put("is_closing_2f", roles != null && roles.contains(ClosingRole.ROLE_2F));
-                record.put("is_closing_3f", roles != null && roles.contains(ClosingRole.ROLE_3F));
-            } else {
-                record.put("is_closing_1r", false);
-                record.put("is_closing_2f", false);
-                record.put("is_closing_3f", false);
-            }
+            // Check if this staff has a closing role at this location/date
+            String closingKey = slot.getStaff().getId() + "|" + slot.getLocationId() + "|" + slot.getDate();
+            ClosingRole closingRole = staffClosingMap.get(closingKey);
+            record.put("is_closing_1r", closingRole == ClosingRole.ROLE_1R);
+            record.put("is_closing_2f", closingRole == ClosingRole.ROLE_2F);
+            record.put("is_closing_3f", closingRole == ClosingRole.ROLE_3F);
 
             record.put("solver_run_id", solverRunId.toString());
             records.add(record);
@@ -746,9 +579,9 @@ public class SupabaseRepository {
 
         if (!records.isEmpty()) {
             postToSupabase("staff_assignments", records);
-            log.info("Saved {} assignments (excluding admin, rest)", records.size());
+            log.info("Saved {} slot assignments", records.size());
         } else {
-            log.warn("No non-admin assignments to save!");
+            log.warn("No slot assignments to save!");
         }
     }
 
