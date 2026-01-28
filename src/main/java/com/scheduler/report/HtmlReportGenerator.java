@@ -389,12 +389,13 @@ public class HtmlReportGenerator {
             .filter(s -> s.getStaff() != null)
             .collect(Collectors.groupingBy(ShiftSlot::getStaff));
 
-        // Build closing map: staff+location+date -> ClosingRole
+        // Build closing map: staff+date -> ClosingRole (show badge on all slots for that day)
         Map<String, ClosingRole> closingMap = new HashMap<>();
         for (ClosingAssignment ca : solution.getClosingAssignments()) {
             if (ca.getStaff() != null) {
-                String key = ca.getStaff().getId() + "|" + ca.getLocationId() + "|" + ca.getDate();
-                closingMap.put(key, ca.getRole());
+                String key = ca.getStaff().getId() + "|" + ca.getDate();
+                // Keep first role if multiple (shouldn't happen often)
+                closingMap.putIfAbsent(key, ca.getRole());
             }
         }
 
@@ -468,10 +469,10 @@ public class HtmlReportGenerator {
         String label = getLabel(shift);
         String tooltip = getTooltip(shift);
 
-        // Check if this staff has a closing role at this location/date
+        // Check if this staff has a closing role on this date (any location)
         String closingBadge = "";
-        if (slot.getStaff() != null && slot.getLocationId() != null) {
-            String closingKey = slot.getStaff().getId() + "|" + slot.getLocationId() + "|" + slot.getDate();
+        if (slot.getStaff() != null) {
+            String closingKey = slot.getStaff().getId() + "|" + slot.getDate();
             ClosingRole closingRole = closingMap.get(closingKey);
             if (closingRole != null) {
                 closingBadge = " <span class=\"closing-badge\">[" + closingRole.getDisplayName() + "]</span>";
