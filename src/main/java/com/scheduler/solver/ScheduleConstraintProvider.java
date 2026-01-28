@@ -60,7 +60,8 @@ public class ScheduleConstraintProvider implements ConstraintProvider {
             // CLOSING CONSTRAINTS (ClosingAssignment entity)
             // =====================================================================
 
-            closingStaffMustWorkAtLocation(factory), // H-CLOSING-WORK: Staff must work at location
+            closingStaffMustWorkFullDayAM(factory),  // H-CLOSING-FULLDAY-AM: Must work AM at location
+            closingStaffMustWorkFullDayPM(factory),  // H-CLOSING-FULLDAY-PM: Must work PM at location
             closing1rDifferentFrom2f(factory),       // H-CLOSING: 1R ≠ 2F (HARD)
             unassignedClosingPenalty(factory),       // M-CLOSING-UNASSIGNED: Penalty for unassigned
 
@@ -245,18 +246,35 @@ public class ScheduleConstraintProvider implements ConstraintProvider {
     // =========================================================================
 
     /**
-     * H-CLOSING-WORK: Staff assigned to a ClosingAssignment must work at that location on that date.
-     * This ensures the person with closing responsibility is actually present.
+     * H-CLOSING-FULLDAY-AM: Staff with closing must work the AM shift at that location.
+     * Combined with H-CLOSING-FULLDAY-PM, this ensures closing staff works the FULL day.
      */
-    Constraint closingStaffMustWorkAtLocation(ConstraintFactory factory) {
+    Constraint closingStaffMustWorkFullDayAM(ConstraintFactory factory) {
         return factory.forEach(ClosingAssignment.class)
             .filter(ca -> ca.getStaff() != null)
             .ifNotExists(ShiftSlot.class,
                 Joiners.equal(ca -> ca.getStaff().getId(), slot -> slot.getStaff() != null ? slot.getStaff().getId() : null),
                 Joiners.equal(ClosingAssignment::getLocationId, ShiftSlot::getLocationId),
-                Joiners.equal(ClosingAssignment::getDate, ShiftSlot::getDate))
+                Joiners.equal(ClosingAssignment::getDate, ShiftSlot::getDate),
+                Joiners.equal(ca -> 1, ShiftSlot::getPeriodId))  // AM = periodId 1
             .penalize(HardMediumSoftScore.ofHard(10000))
-            .asConstraint("H-CLOSING-WORK: Staff must work at location");
+            .asConstraint("H-CLOSING-FULLDAY-AM: Closing staff must work AM");
+    }
+
+    /**
+     * H-CLOSING-FULLDAY-PM: Staff with closing must work the PM shift at that location.
+     * Combined with H-CLOSING-FULLDAY-AM, this ensures closing staff works the FULL day.
+     */
+    Constraint closingStaffMustWorkFullDayPM(ConstraintFactory factory) {
+        return factory.forEach(ClosingAssignment.class)
+            .filter(ca -> ca.getStaff() != null)
+            .ifNotExists(ShiftSlot.class,
+                Joiners.equal(ca -> ca.getStaff().getId(), slot -> slot.getStaff() != null ? slot.getStaff().getId() : null),
+                Joiners.equal(ClosingAssignment::getLocationId, ShiftSlot::getLocationId),
+                Joiners.equal(ClosingAssignment::getDate, ShiftSlot::getDate),
+                Joiners.equal(ca -> 2, ShiftSlot::getPeriodId))  // PM = periodId 2
+            .penalize(HardMediumSoftScore.ofHard(10000))
+            .asConstraint("H-CLOSING-FULLDAY-PM: Closing staff must work PM");
     }
 
     /**
